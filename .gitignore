@@ -1,0 +1,42 @@
+# Project docs kept out of the public repo (deliberate)
+CLAUDE.md
+RAZORPAY.md
+JOURNAL.md
+
+
+# Secrets — never commit. .env.example is the committed template.
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# uv / virtualenv. uv.lock IS committed — it pins the reproducible install.
+.venv/
+venv/
+
+# SQLite stores. -wal and -shm are WAL-mode sidecars; they appear whenever
+# the store is opened, so ignore them explicitly rather than relying on *.db.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Test / tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Editors and OS cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
