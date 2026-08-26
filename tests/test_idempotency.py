@@ -389,3 +389,47 @@ def test_action_that_raises_leaves_the_key_retryable(store, processor):
 
     assert store.execute("key-1", p, charge_action(processor, p)).outcome is Outcome.REPLAYED
     assert processor.charge_count == 1
+
+
+# -- agent namespacing (Phase 3: keys are scoped, not global) --------------
+
+def test_two_agents_using_the_same_key_do_not_collide(store, processor):
+    """Without namespacing, agent B would get agent A's result replayed back."""
+    p = payload()
+
+    a = store.execute("shared-key", p, charge_action(processor, p), agent_id="agent_A")
+    b = store.execute("shared-key", p, charge_action(processor, p), agent_id="agent_B")
+
+    assert a.outcome is Outcome.EXECUTED
+    assert b.outcome is Outcome.EXECUTED, "agent B was blocked by agent A's key"
+    assert processor.charge_count == 2
+    assert a.response["charge_id"] != b.response["charge_id"]
+
+
+def test_namespacing_still_replays_within_one_agent(store, processor):
+    p = payload()
+    first = store.execute("k", p, charge_action(processor, p), agent_id="agent_A")
+    second = store.execute("k", p, charge_action(processor, p), agent_id="agent_A")
+
+    assert first.outcome is Outcome.EXECUTED
+    assert second.outcome is Outcome.REPLAYED
+    assert processor.charge_count == 1
+
+
+def test_result_reports_the_unscoped_key(store, processor):
+    """Callers get their own key back, not the internal scoped form."""
+    p = payload()
+    r = store.execute("my-key", p, charge_action(processor, p), agent_id="agent_A")
+    assert r.key == "my-key"
+
+
+def test_one_agent_cannot_conflict_another_agents_key(store, processor):
+    """A tampered payload from agent B must not touch agent A's record."""
+    original = payload(amount=50_000)
+    tampered = payload(amount=5_000_000)
+
+    store.execute("k", original, charge_action(processor, original), agent_id="A")
+    b = store.execute("k", tampered, charge_action(processor, tampered), agent_id="B")
+
+    assert b.outcome is Outcome.EXECUTED, "agent B saw agent A's key as a conflict"
+    assert processor.charge_count == 2
