@@ -3,7 +3,10 @@ name = "zerotrust-razorpay"
 version = "0.1.0"
 description = "Zero-Trust Payment Authorization for AI Agents on Razorpay"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "httpx>=0.28.1",
+    "python-dotenv>=1.2.3",
+]
 
 [dependency-groups]
 dev = [
@@ -19,3 +22,6 @@ packages = ["zerotrust"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "live: hits the real Razorpay test-mode API; skipped unless RAZORPAY_KEY_ID is set",
+]
