@@ -2,7 +2,7 @@
 CLAUDE.md
 RAZORPAY.md
 JOURNAL.md
-
+docs/learning-log
 
 # Secrets — never commit. .env.example is the committed template.
 .env
