@@ -55,6 +55,11 @@ class Result:
         return self.outcome in EXECUTING_OUTCOMES
 
 
+def scope_key(key: str, agent_id: Optional[str] = None) -> str:
+    """Namespace a key to an agent, so two agents cannot collide on one string."""
+    return f"{agent_id}:{key}" if agent_id else key
+
+
 def fingerprint(payload: dict) -> str:
     """Stable hash of a payload, so 'same key, different payload' is detectable."""
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -104,11 +109,12 @@ class IdempotencyStore:
         conn.row_factory = sqlite3.Row
         return conn
 
-    def get(self, key: str) -> Optional[sqlite3.Row]:
+    def get(self, key: str, agent_id: Optional[str] = None) -> Optional[sqlite3.Row]:
         conn = self._connect()
         try:
             return conn.execute(
-                "SELECT * FROM idempotency_records WHERE key = ?", (key,)
+                "SELECT * FROM idempotency_records WHERE key = ?",
+                (scope_key(key, agent_id),),
             ).fetchone()
         finally:
             conn.close()
@@ -234,24 +240,41 @@ class IdempotencyStore:
     # -- public API -------------------------------------------------------
 
     def execute(
-        self, key: str, payload: dict, action: Callable[[], Any]
+        self,
+        key: str,
+        payload: dict,
+        action: Callable[[], Any],
+        agent_id: Optional[str] = None,
     ) -> Result:
         """Run `action` at most once for this key.
 
         `action` is invoked only for EXECUTED and RECLAIMED outcomes. For
         REPLAYED the saved response comes back instead; for IN_PROGRESS and
         CONFLICT nothing runs at all.
+
+        `agent_id` namespaces the key. Without it, two unrelated agents that
+        happen to pick the same key string would collide -- one would see the
+        other's result replayed back, or be blocked by it. Callers that handle
+        more than one agent should always pass it; it is optional only so that
+        single-agent callers (and Phase 1's tests) keep working unchanged.
         """
+        scoped = scope_key(key, agent_id)
         fp = fingerprint(payload)
-        claim = self._claim(key, fp)
+        claim = self._claim(scoped, fp)
         if not claim.executed:
-            return claim
+            return Result(
+                claim.outcome,
+                key,
+                response=claim.response,
+                reason=claim.reason,
+                attempts=claim.attempts,
+            )
 
         try:
             response = action()
         except Exception:
-            self._abandon(key)
+            self._abandon(scoped)
             raise
 
-        self._finish(key, response)
+        self._finish(scoped, response)
         return Result(claim.outcome, key, response=response, attempts=claim.attempts)
