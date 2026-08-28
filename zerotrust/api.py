@@ -1,0 +1,161 @@
+"""Phase 5 — the HTTP surface an agent calls.
+
+A thin adapter. Every rule lives in `CheckoutService`, `PolicyEngine`,
+`IdempotencyStore` and `AuditLog`; this module translates HTTP to those and
+back. Deliberately so -- a security property that only holds when reached over
+HTTP is a property that can be bypassed by not using HTTP.
+
+The flow an agent follows:
+
+    GET  /catalog                        what may I buy?
+    POST /intents                        natural language -> a draft, shown to a human
+    POST /purchase-intents               a structured ask -> the same draft
+    POST /intents/{id}/confirm           the human says yes  -> policy -> execution
+    POST /intents/{id}/decline           the human says no   -> terminal
+    GET  /audit/{request_id}             what happened, and why
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+
+from zerotrust.checkout import CheckoutError, CheckoutService
+
+_CODE_STATUS = {
+    "ITEM_NOT_IN_CATALOG": 404,
+    "UNKNOWN_REQUEST": 404,
+    "ITEM_UNAVAILABLE": 409,
+    "ALREADY_DECLINED": 409,
+    "REQUEST_EXPIRED": 410,
+    "PRICE_MISMATCH": 409,
+    "NEEDS_CLARIFICATION": 422,
+    "NO_PARSER": 501,
+}
+
+
+class IntentRequest(BaseModel):
+    agent_id: str
+    text: str = Field(..., description="natural language purchase request")
+
+
+class StructuredRequest(BaseModel):
+    agent_id: str
+    sku: str
+    quantity: int = 1
+
+
+class ConfirmRequest(BaseModel):
+    """`amount_paise` is what the client claims was on screen.
+
+    It is checked against what we displayed AND against the catalog's current
+    price. It is never used as the amount to charge.
+    """
+
+    amount_paise: Optional[int] = None
+
+
+def create_app(checkout: CheckoutService) -> FastAPI:
+    app = FastAPI(
+        title="Zero-Trust Payment Authorization for AI Agents",
+        description=(
+            "An agent may propose a purchase. It cannot approve one. Every "
+            "request passes human confirmation and an independent policy check."
+        ),
+        version="0.1.0",
+    )
+
+    def _fail(exc: CheckoutError):
+        raise HTTPException(
+            status_code=_CODE_STATUS.get(exc.code, 400),
+            detail={"code": exc.code, "reason": exc.reason},
+        )
+
+    @app.get("/catalog")
+    def get_catalog():
+        return {"items": [item.as_dict() for item in checkout.catalog.all()]}
+
+    @app.post("/intents", status_code=201)
+    def create_intent(body: IntentRequest):
+        """Natural language in. Returns a DRAFT for a human to confirm."""
+        try:
+            pending = checkout.propose_from_text(body.agent_id, body.text)
+        except CheckoutError as exc:
+            _fail(exc)
+        return {
+            "awaiting_confirmation": pending.as_dict(),
+            "note": "no policy check has run yet; confirmation is required first",
+        }
+
+    @app.post("/purchase-intents", status_code=201)
+    def create_structured_intent(body: StructuredRequest):
+        """A structured ask, bypassing the LLM entirely.
+
+        The structured surface exists regardless of the intent layer: the LLM
+        is untrusted and must not be the only way in.
+        """
+        try:
+            pending = checkout.propose(body.agent_id, body.sku, body.quantity)
+        except CheckoutError as exc:
+            _fail(exc)
+        return {"awaiting_confirmation": pending.as_dict()}
+
+    @app.get("/intents/{request_id}")
+    def read_intent(request_id: str):
+        try:
+            return checkout.get_pending(request_id).as_dict()
+        except CheckoutError as exc:
+            _fail(exc)
+
+    @app.post("/intents/{request_id}/confirm")
+    def confirm_intent(request_id: str, body: ConfirmRequest = ConfirmRequest()):
+        try:
+            outcome = checkout.confirm(request_id, body.amount_paise)
+        except CheckoutError as exc:
+            _fail(exc)
+
+        return {
+            "request_id": outcome.request_id,
+            "approved": outcome.approved,
+            "rule": outcome.rule.value if outcome.rule else None,
+            "reason": outcome.reason,
+            "idempotency_outcome": outcome.outcome.value if outcome.outcome else None,
+            "executed": outcome.executed,
+            "response": outcome.response,
+        }
+
+    @app.post("/intents/{request_id}/decline")
+    def decline_intent(request_id: str):
+        try:
+            pending = checkout.decline(request_id)
+        except CheckoutError as exc:
+            _fail(exc)
+        return {
+            "request_id": pending.request_id,
+            "status": pending.status.value,
+            "note": "declined -- no policy check, no execution, no charge",
+        }
+
+    @app.get("/audit/{request_id}")
+    def read_audit(request_id: str):
+        if checkout.audit is None:
+            raise HTTPException(status_code=501, detail="no audit log configured")
+        entries = checkout.audit.for_request(request_id)
+        return {
+            "request_id": request_id,
+            "events": [
+                {
+                    "event_id": e.event_id,
+                    "event_type": e.event_type.value,
+                    "actor": e.actor.value,
+                    "rule": e.rule,
+                    "reason": e.reason,
+                    "details": e.details,
+                }
+                for e in entries
+            ],
+        }
+
+    return app
