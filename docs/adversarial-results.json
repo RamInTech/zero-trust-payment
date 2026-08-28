@@ -1,0 +1,166 @@
+{
+  "attacks": [
+    {
+      "attack": "Re-submit a completed purchase with its original payload",
+      "defence": "Idempotency key claimed by a unique-constraint INSERT",
+      "defended": true,
+      "evidence": "second submission returned REPLAYED with the original order id order_0001",
+      "expected": "Replayed from the saved result; not executed a second time",
+      "intended_actions": 1,
+      "money_actions": 1,
+      "name": "replay_completed_transaction",
+      "status": "DEFENDED",
+      "surface": "HTTP API"
+    },
+    {
+      "attack": "Confirm a displayed request while claiming amount_paise=1",
+      "defence": "Confirm-time price re-validation against the catalog",
+      "defended": true,
+      "evidence": "HTTP 409 PRICE_MISMATCH: the confirmed amount does not match the amount that was displayed: displayed Rs.0.01, actual Rs.150.00",
+      "expected": "Rejected before execution; never charged at either amount",
+      "intended_actions": 0,
+      "money_actions": 0,
+      "name": "replay_with_tampered_amount",
+      "status": "DEFENDED",
+      "surface": "HTTP API"
+    },
+    {
+      "attack": "Reuse a spent idempotency key with a changed amount",
+      "defence": "Payload fingerprint compared against the stored claim",
+      "defended": true,
+      "evidence": "outcome=REJECTED_CONFLICT; idempotency key reused with a different payload; the original request is unaffected",
+      "expected": "Rejected as a conflict; the original charge untouched",
+      "intended_actions": 1,
+      "money_actions": 1,
+      "name": "idempotency_conflict_on_tampered_replay",
+      "status": "DEFENDED",
+      "surface": "in-process (second line of defence)"
+    },
+    {
+      "attack": "Purchase an allowed item priced 10x over the mandate cap",
+      "defence": "Policy engine: AMOUNT_EXCEEDS_CAP",
+      "defended": true,
+      "evidence": "amount 500000 paise exceeds the per-transaction cap of 50000 paise",
+      "expected": "Denied, citing the per-transaction cap",
+      "intended_actions": 0,
+      "money_actions": 0,
+      "name": "exceed_per_transaction_cap",
+      "status": "DEFENDED",
+      "surface": "HTTP API"
+    },
+    {
+      "attack": "Purchase a catalog item absent from the mandate allowlist",
+      "defence": "Policy engine: SKU_NOT_ALLOWED (allowlist fails closed)",
+      "defended": true,
+      "evidence": "sku 'SKU-MUG' is not in the mandate's allowlist",
+      "expected": "Denied, naming the disallowed item",
+      "intended_actions": 0,
+      "money_actions": 0,
+      "name": "purchase_disallowed_item",
+      "status": "DEFENDED",
+      "surface": "HTTP API"
+    },
+    {
+      "attack": "Fire 12 simultaneous purchases against a limit of 3 per hour",
+      "defence": "Velocity slot claimed inside one BEGIN IMMEDIATE transaction",
+      "defended": true,
+      "evidence": "3 approved, 9 denied (all VELOCITY_EXCEEDED), 3 charges",
+      "expected": "Exactly 3 succeed; the rest denied by the velocity rule",
+      "intended_actions": 3,
+      "money_actions": 3,
+      "name": "velocity_burst",
+      "status": "DEFENDED",
+      "surface": "HTTP API"
+    },
+    {
+      "attack": "Two different valid purchases submitted simultaneously",
+      "defence": "Keys are independent; only identical keys collide",
+      "defended": true,
+      "evidence": "2 approved, 2 charges, 2 distinct orders",
+      "expected": "Both succeed independently, with no interference",
+      "intended_actions": 2,
+      "money_actions": 2,
+      "name": "concurrent_distinct_purchases",
+      "status": "DEFENDED",
+      "surface": "HTTP API"
+    },
+    {
+      "attack": "A fully compromised LLM proposes a disallowed item, and a human confirms it",
+      "defence": "Policy engine: AMOUNT_EXCEEDS_CAP (the parser holds no authority to give away)",
+      "defended": true,
+      "evidence": "amount 90000 paise exceeds the per-transaction cap of 50000 paise",
+      "expected": "Denied by the policy engine regardless of the LLM output or the human's confirmation",
+      "intended_actions": 0,
+      "money_actions": 0,
+      "name": "compromised_intent_parser",
+      "status": "DEFENDED",
+      "surface": "HTTP API"
+    },
+    {
+      "attack": "Decline a request, then confirm it anyway",
+      "defence": "Declined requests are terminal; no path back to execution",
+      "defended": true,
+      "evidence": "HTTP 409 ALREADY_DECLINED",
+      "expected": "Refused; a declined request is terminal",
+      "intended_actions": 0,
+      "money_actions": 0,
+      "name": "confirmation_bypass_after_decline",
+      "status": "DEFENDED",
+      "surface": "HTTP API"
+    },
+    {
+      "attack": "Spend under a mandate that has already expired",
+      "defence": "Policy engine: MANDATE_EXPIRED",
+      "defended": true,
+      "evidence": "mandate mdt_73067d0272e4 expired 1s ago",
+      "expected": "Denied, citing expiry specifically",
+      "intended_actions": 0,
+      "money_actions": 0,
+      "name": "spend_after_mandate_expiry",
+      "status": "DEFENDED",
+      "surface": "HTTP API"
+    },
+    {
+      "attack": "Purchase a SKU that is not in the catalog at all",
+      "defence": "Catalog lookup precedes the policy engine",
+      "defended": true,
+      "evidence": "HTTP 404 ITEM_NOT_IN_CATALOG; velocity slots unchanged at 0",
+      "expected": "Rejected before the policy engine; no velocity budget spent",
+      "intended_actions": 0,
+      "money_actions": 0,
+      "name": "purchase_nonexistent_item",
+      "status": "DEFENDED",
+      "surface": "HTTP API"
+    },
+    {
+      "attack": "Rewrite and delete audit entries with raw SQL, bypassing the application entirely",
+      "defence": "BEFORE UPDATE / BEFORE DELETE triggers RAISE(ABORT)",
+      "defended": true,
+      "evidence": "4/4 statements aborted; 138 entries intact (audit_log is append-only: UPDATE is not permitted)",
+      "expected": "Every statement rejected; the record is unchanged",
+      "intended_actions": 0,
+      "money_actions": 0,
+      "name": "erase_the_audit_trail",
+      "status": "DEFENDED",
+      "surface": "direct database access"
+    }
+  ],
+  "generated_at": 1787934172.980949,
+  "generated_at_utc": "2026-08-28 16:22:52 UTC",
+  "mandate": {
+    "allowed_skus": [
+      "SKU-CAKE",
+      "SKU-COFFEE",
+      "SKU-TEA"
+    ],
+    "max_amount_paise": 50000,
+    "velocity_limit": 3,
+    "velocity_window_secs": 3600.0
+  },
+  "totals": {
+    "attacks": 12,
+    "breached": 0,
+    "defended": 12,
+    "unintended_charges": 0
+  }
+}
