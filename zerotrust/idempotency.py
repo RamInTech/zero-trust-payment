@@ -24,6 +24,11 @@ from typing import Any, Callable, Optional
 PROCESSING = "PROCESSING"
 COMPLETED = "COMPLETED"
 FAILED = "FAILED"
+#: The provider call's true outcome is UNKNOWN -- a timeout, or a crash between
+#: the provider succeeding and this record being written. Never reclaimed by
+#: the staleness timeout, because retrying could double charge. Only
+#: reconciliation (Phase 7) may move a record out of this state.
+PENDING_VERIFICATION = "PENDING_VERIFICATION"
 
 DEFAULT_STALE_AFTER_SECONDS = 30.0
 
@@ -36,6 +41,10 @@ class Outcome(str, Enum):
     RECLAIMED = "RECLAIMED"        # prior claimant went stale; we ran the action
     IN_PROGRESS = "IN_PROGRESS"    # key is genuinely mid-flight; caller retries later
     CONFLICT = "REJECTED_CONFLICT" # key reused with a different payload; rejected
+    #: A previous attempt's outcome is unknown. Blocked until reconciliation
+    #: resolves it -- retrying here is exactly how a timeout becomes a double
+    #: charge, so this state deliberately refuses to proceed.
+    AWAITING_VERIFICATION = "AWAITING_VERIFICATION"
 
 
 #: Outcomes for which the underlying action was actually invoked.
@@ -163,6 +172,23 @@ class IdempotencyStore:
                         attempts=row["attempts"],
                     )
 
+                if row["status"] == PENDING_VERIFICATION:
+                    # The dangerous case. A previous attempt may or may not
+                    # have moved money. Staleness must NOT rescue this record:
+                    # reclaiming it is precisely how an unknown outcome turns
+                    # into a second charge. Only reconciliation resolves it.
+                    conn.execute("COMMIT")
+                    return Result(
+                        Outcome.AWAITING_VERIFICATION,
+                        key,
+                        reason=(
+                            "a previous attempt's outcome is unknown and is "
+                            "awaiting reconciliation; retrying could double "
+                            "charge"
+                        ),
+                        attempts=row["attempts"],
+                    )
+
                 if row["status"] == FAILED:
                     # The prior attempt raised before completing; nothing was
                     # recorded as done, so a fresh attempt may take the key.
@@ -234,6 +260,78 @@ class IdempotencyStore:
                 (FAILED, key),
             )
             conn.execute("COMMIT")
+        finally:
+            conn.close()
+
+    def mark_pending_verification(
+        self, key: str, reason: str, agent_id: Optional[str] = None
+    ) -> None:
+        """Record that this key's true outcome is unknown.
+
+        Called when the provider call timed out, or when the process died
+        between the provider succeeding and the completion write. The record
+        is frozen here until reconciliation resolves it.
+        """
+        scoped = scope_key(key, agent_id)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "UPDATE idempotency_records SET status = ?, response = ? "
+                "WHERE key = ?",
+                (
+                    PENDING_VERIFICATION,
+                    json.dumps({"pending_reason": reason}),
+                    scoped,
+                ),
+            )
+            updated = cur.rowcount
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+
+        if updated != 1:
+            # Marking a key that was never claimed means a caller believes a
+            # money action is in doubt for a request this store has never
+            # seen. Failing loudly beats a silent no-op that would leave the
+            # doubt unrecorded -- which is the one thing this state exists to
+            # prevent.
+            raise KeyError(
+                f"cannot mark '{key}' pending verification: no such "
+                f"idempotency record"
+            )
+
+    def resolve_verified(
+        self, key: str, response: dict, agent_id: Optional[str] = None
+    ) -> None:
+        """Reconciliation confirmed the action DID happen. Record the truth."""
+        self._finish(scope_key(key, agent_id), response)
+
+    def resolve_not_executed(
+        self, key: str, agent_id: Optional[str] = None
+    ) -> None:
+        """Reconciliation confirmed the action did NOT happen; retry is safe."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "UPDATE idempotency_records SET status = ?, response = NULL "
+                "WHERE key = ?",
+                (FAILED, scope_key(key, agent_id)),
+            )
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+
+    def pending_verification(self) -> list[sqlite3.Row]:
+        """Every record whose outcome is still unknown."""
+        conn = self._connect()
+        try:
+            return conn.execute(
+                "SELECT * FROM idempotency_records WHERE status = ? "
+                "ORDER BY claimed_at",
+                (PENDING_VERIFICATION,),
+            ).fetchall()
         finally:
             conn.close()
 
