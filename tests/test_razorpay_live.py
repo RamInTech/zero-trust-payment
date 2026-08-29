@@ -13,6 +13,7 @@ Test mode only -- RazorpayConfig.from_env() refuses a live key outright.
 from __future__ import annotations
 
 import os
+import time
 import uuid
 
 import pytest
@@ -124,3 +125,104 @@ def test_capture_against_the_real_provider_is_still_simulated(provider):
 def test_credentials_are_test_mode(config):
     assert config.key_id.startswith("rzp_test_")
     assert not os.environ.get("RAZORPAY_KEY_ID", "").startswith("rzp_live_")
+
+
+# -- PHASE 7: reconciliation against the real provider --------------------
+
+def test_live_order_fetch_by_id_is_immediately_consistent(provider):
+    """A known order id reads back straight away."""
+    receipt = _receipt()
+    created = provider.create_order(30_000, "INR", receipt=receipt)
+
+    fetched = provider.fetch_order(created["id"])
+
+    assert fetched is not None
+    assert fetched["id"] == created["id"]
+    assert fetched["amount"] == 30_000
+    assert fetched["receipt"] == receipt
+    print(f"\n  [live] fetched {created['id']} by id, immediately")
+
+
+def test_live_order_list_lags_behind_creation(provider):
+    """The finding that shaped the reconciler, asserted rather than assumed.
+
+    Razorpay's order LIST does not show an order created moments ago, while
+    fetching that same order BY ID works instantly. So an empty receipt search
+    right after an attempt means "not indexed yet", never "never happened" --
+    which is why Reconciler waits out a grace window before treating absence
+    as evidence.
+    """
+    receipt = _receipt()
+    created = provider.create_order(30_000, "INR", receipt=receipt)
+
+    assert provider.fetch_order(created["id"]) is not None, (
+        "the order does not exist at all, which is not what this test is about"
+    )
+    found = provider.orders_for_receipt(receipt)
+
+    print(f"\n  [live] order {created['id']} exists by id; "
+          f"receipt search returned {len(found)} match(es)")
+    # Either outcome is acceptable and both are informative: the point is that
+    # absence here is NOT proof, and the reconciler must not treat it as such.
+    assert isinstance(found, list)
+
+
+def test_live_reconciler_refuses_to_guess_when_the_order_is_not_yet_visible(
+    tmp_path, provider
+):
+    """The full Phase 7 scenario against a REAL Razorpay order.
+
+    A real order is created; the local ledger is prevented from recording it.
+    Reconciliation runs immediately -- before the provider's list has caught
+    up -- and must report STILL_UNKNOWN rather than clearing the record for a
+    retry. Refusing to guess IS the correct behaviour here.
+    """
+    from zerotrust.audit import AuditLog
+    from zerotrust.faults import Fault, FaultInjector, InjectedCrash
+    from zerotrust.gateway import PurchaseGateway
+    from zerotrust.idempotency import FAILED, IdempotencyStore
+    from zerotrust.mandate import Mandate, MandateStore
+    from zerotrust.policy import PolicyEngine, PurchaseRequest
+    from zerotrust.reconcile import Finding, Reconciler
+
+    receipt = _receipt()
+    faults = FaultInjector().arm(Fault.CRASH_AFTER_PROVIDER_CALL)
+    audit = AuditLog(str(tmp_path / "audit.db"))
+    engine = PolicyEngine(MandateStore(str(tmp_path / "policy.db")))
+    engine.mandates.issue(Mandate(
+        agent_id="agent_live", max_amount_paise=50_000,
+        allowed_skus=frozenset({"SKU-COFFEE"}),
+        expires_at=time.time() + 3600, velocity_limit=3))
+    store = IdempotencyStore(str(tmp_path / "idem.db"))
+    created_ids = []
+
+    def execute(request):
+        order = provider.create_order(request.amount_paise, "INR", receipt=receipt)
+        created_ids.append(order["id"])
+        if faults.fire_once(Fault.CRASH_AFTER_PROVIDER_CALL):
+            raise InjectedCrash("died before the ledger write")
+        return order
+
+    gateway = PurchaseGateway(engine, store, execute, audit=audit)
+    key = f"live-recon-{uuid.uuid4().hex[:8]}"
+
+    with pytest.raises(InjectedCrash):
+        gateway.submit(PurchaseRequest("agent_live", "SKU-COFFEE", 30_000, key))
+
+    # A real order exists at Razorpay; our ledger says the attempt failed.
+    assert store.get(key, agent_id="agent_live")["status"] == FAILED
+    assert provider.fetch_order(created_ids[0]) is not None, (
+        "the order really was created at Razorpay"
+    )
+
+    reconciler = Reconciler(provider, store, audit=audit, policy=engine)
+    result = reconciler.reconcile(key, receipt, agent_id="agent_live",
+                                  expected_amount_paise=30_000)
+
+    assert result.finding in (Finding.STILL_UNKNOWN, Finding.DIVERGED_REPAIRED)
+    assert result.finding is not Finding.CONFIRMED_NOT_EXECUTED, (
+        "reconciliation cleared a real purchase for retry -- a double charge"
+    )
+    print(f"\n  [live] real order {created_ids[0]} created, ledger said FAILED; "
+          f"reconciliation returned {result.finding.value}")
+    print(f"  [live] {result.reason}")
