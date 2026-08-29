@@ -29,6 +29,10 @@ import httpx
 from zerotrust.config import RazorpayConfig
 
 DEFAULT_TIMEOUT_SECONDS = 10.0
+#: Reconciliation pages through recent orders rather than trusting a server-side
+#: receipt filter. See RazorpayTestModeProvider.orders_for_receipt.
+DEFAULT_LOOKUP_PAGE_SIZE = 100   # Razorpay's maximum
+DEFAULT_MAX_LOOKUP_PAGES = 20    # 2,000 orders; beyond this we admit we cannot tell
 
 
 class ProviderError(RuntimeError):
@@ -58,6 +62,18 @@ class PaymentProvider(Protocol):
 
     def simulate_capture(self, order_id: str, amount_paise: int) -> dict: ...
 
+    def orders_for_receipt(self, receipt: str) -> list[dict]:
+        """Every order the provider holds for this receipt.
+
+        The provider side of reconciliation (Phase 7). Answers the only
+        question that matters after an ambiguous failure: did the money
+        actually move? Returning [] means "the provider has no such order",
+        NOT "we could not find out" -- an unanswerable lookup raises
+        ProviderTimeout instead, because the difference between those two is
+        the whole point of PENDING_VERIFICATION.
+        """
+        ...
+
 
 class RazorpayTestModeProvider:
     """Real, server-to-server calls against Razorpay's test-mode API."""
@@ -67,8 +83,12 @@ class RazorpayTestModeProvider:
         config: RazorpayConfig,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         transport: Optional[httpx.BaseTransport] = None,
+        lookup_page_size: int = DEFAULT_LOOKUP_PAGE_SIZE,
+        max_lookup_pages: int = DEFAULT_MAX_LOOKUP_PAGES,
     ) -> None:
         self.config = config
+        self.lookup_page_size = lookup_page_size
+        self.max_lookup_pages = max_lookup_pages
         # `transport` exists so tests can stub the network with
         # httpx.MockTransport without touching the request-building code.
         self._client = httpx.Client(
@@ -124,6 +144,91 @@ class RazorpayTestModeProvider:
 
         return response.json()
 
+    def orders_for_receipt(self, receipt: str) -> list[dict]:
+        """Find every order carrying this receipt, by paging and matching locally.
+
+        NOT `GET /v1/orders?receipt=...`. That filter is silently ignored by
+        the test-mode API: it returns `count: 0` for a receipt that provably
+        exists, with HTTP 200 and no error. For a reconciler that is the worst
+        possible failure -- an empty result means "the provider never executed
+        this", so a silently-ignored filter would conclude a real purchase
+        never happened and clear the way for a second charge. Verified against
+        a live test-mode account; see JOURNAL.md.
+
+        So the search is done here instead: page through recent orders and
+        match the receipt ourselves. If the search cannot be completed within
+        `max_pages`, that raises rather than returning [] -- "we could not
+        finish looking" must never be reported as "it is not there".
+        """
+        matches: list[dict] = []
+        skip = 0
+
+        for _ in range(self.max_lookup_pages):
+            with self._lock:
+                self.call_count += 1
+
+            try:
+                response = self._client.get(
+                    "/v1/orders",
+                    params={"count": self.lookup_page_size, "skip": skip},
+                )
+            except httpx.TimeoutException as exc:
+                raise ProviderTimeout(
+                    f"Razorpay order lookup for receipt '{receipt}' timed out: "
+                    f"{exc}. The provider's true state is still unknown."
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise ProviderError(f"Razorpay lookup failed: {exc}") from exc
+
+            if response.status_code >= 400:
+                raise ProviderError(
+                    f"Razorpay rejected the lookup ({response.status_code}): "
+                    f"{_describe_error(response)}",
+                    status_code=response.status_code,
+                )
+
+            items = list(response.json().get("items", []))
+            matches.extend(o for o in items if o.get("receipt") == receipt)
+
+            if len(items) < self.lookup_page_size:
+                return matches  # the account is exhausted; [] is trustworthy
+            skip += self.lookup_page_size
+
+        raise ProviderError(
+            f"could not search far enough back to rule out receipt "
+            f"'{receipt}' (stopped after {self.max_lookup_pages} pages of "
+            f"{self.lookup_page_size}); the outcome is unknown, not absent"
+        )
+
+    def fetch_order(self, order_id: str) -> Optional[dict]:
+        """GET /v1/orders/{id} -- a direct, immediately-consistent lookup.
+
+        Unlike the list endpoint (see `orders_for_receipt`), fetching a known
+        id reflects a just-created order straight away. Only usable when the
+        id survived, which is exactly what a crash-before-the-ledger-write
+        destroys -- hence the receipt search as well.
+        """
+        with self._lock:
+            self.call_count += 1
+        try:
+            response = self._client.get(f"/v1/orders/{order_id}")
+        except httpx.TimeoutException as exc:
+            raise ProviderTimeout(
+                f"Razorpay order fetch for '{order_id}' timed out: {exc}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ProviderError(f"Razorpay fetch failed: {exc}") from exc
+
+        if response.status_code == 400 or response.status_code == 404:
+            return None
+        if response.status_code >= 400:
+            raise ProviderError(
+                f"Razorpay rejected the fetch ({response.status_code}): "
+                f"{_describe_error(response)}",
+                status_code=response.status_code,
+            )
+        return response.json()
+
     def simulate_capture(self, order_id: str, amount_paise: int) -> dict:
         """NOT a live capture -- see this module's docstring for why."""
         return _simulated_capture(order_id, amount_paise)
@@ -162,6 +267,10 @@ class SimulatedProvider:
             }
             self.orders.append(order)
         return order
+
+    def orders_for_receipt(self, receipt: str) -> list[dict]:
+        with self._lock:
+            return [o for o in self.orders if o.get("receipt") == receipt]
 
     def simulate_capture(self, order_id: str, amount_paise: int) -> dict:
         return _simulated_capture(order_id, amount_paise)
