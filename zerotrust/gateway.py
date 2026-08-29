@@ -27,6 +27,7 @@ from typing import Callable, Optional
 from zerotrust.audit import Actor, AuditLog, EventType
 from zerotrust.idempotency import IdempotencyStore, Outcome, Result
 from zerotrust.policy import Decision, PolicyEngine, PurchaseRequest
+from zerotrust.provider import ProviderTimeout
 
 #: Every Phase 1 outcome maps to exactly one audit event. No outcome is
 #: unlogged, and none produces two entries.
@@ -36,6 +37,7 @@ OUTCOME_EVENTS = {
     Outcome.RECLAIMED: EventType.IDEMPOTENCY_RECLAIMED,
     Outcome.IN_PROGRESS: EventType.IDEMPOTENCY_IN_PROGRESS,
     Outcome.CONFLICT: EventType.IDEMPOTENCY_CONFLICT,
+    Outcome.AWAITING_VERIFICATION: EventType.PAYMENT_PENDING_VERIFICATION,
 }
 
 
@@ -161,6 +163,30 @@ class PurchaseGateway:
                 logged_action,
                 agent_id=request.agent_id,
             )
+        except ProviderTimeout as exc:
+            # The outcome is UNKNOWN, not failed. Two things follow, and both
+            # are deliberate:
+            #
+            #  1. The record is frozen as PENDING_VERIFICATION, so a retry is
+            #     refused rather than re-executed. Retrying an unknown outcome
+            #     is exactly how a timeout becomes a double charge.
+            #  2. The velocity slot is HELD, not released. Releasing it would
+            #     let an agent manufacture extra budget by inducing timeouts.
+            #     Reconciliation releases it if the purchase never happened.
+            self.store.mark_pending_verification(
+                request.idempotency_key, str(exc), agent_id=request.agent_id)
+            self._log(
+                EventType.PAYMENT_PENDING_VERIFICATION,
+                Actor.PROVIDER,
+                mandate_id=decision.mandate_id,
+                reason=str(exc),
+                details={
+                    "error_type": type(exc).__name__,
+                    "velocity_slot": "held pending reconciliation",
+                },
+                **common,
+            )
+            raise
         except Exception as exc:
             self._log(
                 EventType.PAYMENT_FAILED,
@@ -170,8 +196,8 @@ class PurchaseGateway:
                 details={"error_type": type(exc).__name__},
                 **common,
             )
-            # Hand the velocity slot back: a failed attempt shouldn't silently
-            # consume the agent's budget.
+            # A definite failure: the provider was reached and said no, or we
+            # never got that far. Hand the velocity slot back.
             self.policy.release_slot(request.agent_id, request.idempotency_key)
             raise
 
