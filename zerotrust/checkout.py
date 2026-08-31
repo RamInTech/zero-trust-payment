@@ -79,7 +79,7 @@ class PendingPurchase:
     def prompt(self) -> str:
         """What the human is actually shown."""
         rupees = self.displayed_amount_paise / 100
-        return f"Confirm: buy {self.item_name} ({self.sku}) for Rs.{rupees:,.2f}?"
+        return f"Confirm: buy {self.item_name} ({self.sku}) for \u20b9{rupees:,.2f}?"
 
     def as_dict(self) -> dict:
         return {
@@ -309,8 +309,8 @@ class CheckoutService:
     def _reject_price(self, pending: PendingPurchase, shown: int,
                       actual: int, why: str) -> None:
         reason = (
-            f"{why}: displayed Rs.{shown / 100:,.2f}, "
-            f"actual Rs.{actual / 100:,.2f}"
+            f"{why}: displayed \u20b9{shown / 100:,.2f}, "
+            f"actual \u20b9{actual / 100:,.2f}"
         )
         self._log(
             EventType.POLICY_DENIED, Actor.SYSTEM,
