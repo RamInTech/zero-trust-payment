@@ -28,12 +28,14 @@ from typing import Callable, Optional
 from zerotrust.api import create_app
 from zerotrust.audit import AuditLog, EventType
 from zerotrust.catalog import demo_catalog
+from zerotrust.faults import Fault, FaultInjector
 from zerotrust.checkout import CheckoutService
 from zerotrust.gateway import PurchaseGateway
 from zerotrust.idempotency import IdempotencyStore
 from zerotrust.intent import ParsedIntent, RuleBasedIntentParser
 from zerotrust.mandate import Mandate, MandateStore
 from zerotrust.policy import PolicyEngine, PurchaseRequest
+from zerotrust.provider import ProviderTimeout
 
 HOUR = 3600.0
 
@@ -98,6 +100,7 @@ class AdversarialSuite:
             clock=self._clock)
         self.executed: list[PurchaseRequest] = []
         self._exec_lock = threading.Lock()
+        self.faults = FaultInjector()
 
         self.store = IdempotencyStore(f"{tmpdir}/idem.db", clock=self._clock)
         self.gateway = PurchaseGateway(
@@ -110,6 +113,9 @@ class AdversarialSuite:
 
 
     def _execute(self, request: PurchaseRequest) -> dict:
+        if self.faults.fire_once(Fault.PROVIDER_TIMEOUT):
+            raise ProviderTimeout(
+                "order creation timed out; the order may or may not exist")
         with self._exec_lock:
             self.executed.append(request)
             n = len(self.executed)
@@ -464,6 +470,50 @@ class AdversarialSuite:
             intended_actions=0,
         )
 
+    def attack_retry_after_timeout(self) -> AttackOutcome:
+        """Cause a timeout, then try to retry it into a second charge.
+
+        The gap carried from Phase 2 until Phase 7 closed it. A timed-out
+        purchase has an UNKNOWN outcome: the provider may or may not have
+        executed it. Retrying is how that becomes two charges.
+        """
+        before = self.charge_count
+        agent = self._agent("timeout")
+        pending = self._display("SKU-COFFEE", agent)
+
+        self.faults.arm(Fault.PROVIDER_TIMEOUT)
+        timed_out = self._confirm(pending["request_id"])
+
+        # Now hammer the confirm endpoint, the way an impatient agent would.
+        retries = [self._confirm(pending["request_id"]) for _ in range(5)]
+        caused = self.charge_count - before
+
+        outcomes = {
+            r.json().get("idempotency_outcome")
+            for r in retries if r.status_code == 200
+        }
+        slot_held = self.engine.slots_used(agent, HOUR) == 1
+
+        return AttackOutcome(
+            name="retry_a_timed_out_purchase",
+            attack="Cause a payment timeout, then retry it 5 times to force a "
+                   "second charge",
+            surface="HTTP API",
+            expected="Every retry refused while the outcome is unknown; no "
+                     "second charge, and the velocity slot stays held",
+            defended=(timed_out.status_code == 503
+                      and caused == 0
+                      and outcomes <= {"AWAITING_VERIFICATION"}
+                      and slot_held),
+            defence="PENDING_VERIFICATION freezes the record; the claim refuses "
+                    "and staleness will not reclaim it",
+            evidence=f"HTTP {timed_out.status_code} on the timeout; "
+                     f"retries returned {outcomes or 'non-200'}; "
+                     f"velocity slot held={slot_held}",
+            money_actions=caused,
+            intended_actions=0,
+        )
+
     def attack_audit_tampering(self) -> AttackOutcome:
         """Erase the evidence after being denied."""
         import sqlite3
@@ -547,6 +597,7 @@ class AdversarialSuite:
         "attack_confirmation_bypass",
         "attack_expired_mandate",
         "attack_unknown_item",
+        "attack_retry_after_timeout",
         "attack_audit_tampering",
     ]
 

@@ -16,7 +16,7 @@
       "attack": "Confirm a displayed request while claiming amount_paise=1",
       "defence": "Confirm-time price re-validation against the catalog",
       "defended": true,
-      "evidence": "HTTP 409 PRICE_MISMATCH: the confirmed amount does not match the amount that was displayed: displayed Rs.0.01, actual Rs.150.00",
+      "evidence": "HTTP 409 PRICE_MISMATCH: the confirmed amount does not match the amount that was displayed: displayed \u20b90.01, actual \u20b9150.00",
       "expected": "Rejected before execution; never charged at either amount",
       "intended_actions": 0,
       "money_actions": 0,
@@ -112,7 +112,7 @@
       "attack": "Spend under a mandate that has already expired",
       "defence": "Policy engine: MANDATE_EXPIRED",
       "defended": true,
-      "evidence": "mandate mdt_73067d0272e4 expired 1s ago",
+      "evidence": "mandate mdt_525f4aa09d2b expired 1s ago",
       "expected": "Denied, citing expiry specifically",
       "intended_actions": 0,
       "money_actions": 0,
@@ -133,10 +133,22 @@
       "surface": "HTTP API"
     },
     {
+      "attack": "Cause a payment timeout, then retry it 5 times to force a second charge",
+      "defence": "PENDING_VERIFICATION freezes the record; the claim refuses and staleness will not reclaim it",
+      "defended": true,
+      "evidence": "HTTP 503 on the timeout; retries returned {'AWAITING_VERIFICATION'}; velocity slot held=True",
+      "expected": "Every retry refused while the outcome is unknown; no second charge, and the velocity slot stays held",
+      "intended_actions": 0,
+      "money_actions": 0,
+      "name": "retry_a_timed_out_purchase",
+      "status": "DEFENDED",
+      "surface": "HTTP API"
+    },
+    {
       "attack": "Rewrite and delete audit entries with raw SQL, bypassing the application entirely",
       "defence": "BEFORE UPDATE / BEFORE DELETE triggers RAISE(ABORT)",
       "defended": true,
-      "evidence": "4/4 statements aborted; 138 entries intact (audit_log is append-only: UPDATE is not permitted)",
+      "evidence": "4/4 statements aborted; 165 entries intact (audit_log is append-only: UPDATE is not permitted)",
       "expected": "Every statement rejected; the record is unchanged",
       "intended_actions": 0,
       "money_actions": 0,
@@ -145,8 +157,8 @@
       "surface": "direct database access"
     }
   ],
-  "generated_at": 1787934172.980949,
-  "generated_at_utc": "2026-08-28 16:22:52 UTC",
+  "generated_at": 1788200454.658881,
+  "generated_at_utc": "2026-08-31 18:20:54 UTC",
   "mandate": {
     "allowed_skus": [
       "SKU-CAKE",
@@ -158,9 +170,9 @@
     "velocity_window_secs": 3600.0
   },
   "totals": {
-    "attacks": 12,
+    "attacks": 13,
     "breached": 0,
-    "defended": 12,
+    "defended": 13,
     "unintended_charges": 0
   }
 }

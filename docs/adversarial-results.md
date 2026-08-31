@@ -3,9 +3,9 @@
 
 # Adversarial Suite Results
 
-Generated: 2026-08-28 16:22:52 UTC
+Generated: 2026-08-31 18:20:54 UTC
 
-**12 of 12 attacks defended. 0 unintended charges.**
+**13 of 13 attacks defended. 0 unintended charges.**
 
 Every attack below was run against a live stack through the HTTP API, under this mandate:
 
@@ -26,7 +26,8 @@ Every attack below was run against a live stack through the HTTP API, under this
 | 9 | Decline a request, then confirm it anyway | DEFENDED | Declined requests are terminal; no path back to execution | 0 |
 | 10 | Spend under a mandate that has already expired | DEFENDED | Policy engine: MANDATE_EXPIRED | 0 |
 | 11 | Purchase a SKU that is not in the catalog at all | DEFENDED | Catalog lookup precedes the policy engine | 0 |
-| 12 | Rewrite and delete audit entries with raw SQL, bypassing the application entirely | DEFENDED | BEFORE UPDATE / BEFORE DELETE triggers RAISE(ABORT) | 0 |
+| 12 | Cause a payment timeout, then retry it 5 times to force a second charge | DEFENDED | PENDING_VERIFICATION freezes the record; the claim refuses and staleness will not reclaim it | 0 |
+| 13 | Rewrite and delete audit entries with raw SQL, bypassing the application entirely | DEFENDED | BEFORE UPDATE / BEFORE DELETE triggers RAISE(ABORT) | 0 |
 
 ## Evidence
 
@@ -47,7 +48,7 @@ Every attack below was run against a live stack through the HTTP API, under this
 - **Expected:** Rejected before execution; never charged at either amount
 - **Result:** DEFENDED
 - **Stopped by:** Confirm-time price re-validation against the catalog
-- **What the system said:** HTTP 409 PRICE_MISMATCH: the confirmed amount does not match the amount that was displayed: displayed Rs.0.01, actual Rs.150.00
+- **What the system said:** HTTP 409 PRICE_MISMATCH: the confirmed amount does not match the amount that was displayed: displayed ₹0.01, actual ₹150.00
 - **Money actions caused:** 0 (intended: 0)
 
 ### 3. idempotency_conflict_on_tampered_replay
@@ -127,7 +128,7 @@ Every attack below was run against a live stack through the HTTP API, under this
 - **Expected:** Denied, citing expiry specifically
 - **Result:** DEFENDED
 - **Stopped by:** Policy engine: MANDATE_EXPIRED
-- **What the system said:** mandate mdt_73067d0272e4 expired 1s ago
+- **What the system said:** mandate mdt_525f4aa09d2b expired 1s ago
 - **Money actions caused:** 0 (intended: 0)
 
 ### 11. purchase_nonexistent_item
@@ -140,13 +141,23 @@ Every attack below was run against a live stack through the HTTP API, under this
 - **What the system said:** HTTP 404 ITEM_NOT_IN_CATALOG; velocity slots unchanged at 0
 - **Money actions caused:** 0 (intended: 0)
 
-### 12. erase_the_audit_trail
+### 12. retry_a_timed_out_purchase
+
+- **Attack:** Cause a payment timeout, then retry it 5 times to force a second charge
+- **Surface:** HTTP API
+- **Expected:** Every retry refused while the outcome is unknown; no second charge, and the velocity slot stays held
+- **Result:** DEFENDED
+- **Stopped by:** PENDING_VERIFICATION freezes the record; the claim refuses and staleness will not reclaim it
+- **What the system said:** HTTP 503 on the timeout; retries returned {'AWAITING_VERIFICATION'}; velocity slot held=True
+- **Money actions caused:** 0 (intended: 0)
+
+### 13. erase_the_audit_trail
 
 - **Attack:** Rewrite and delete audit entries with raw SQL, bypassing the application entirely
 - **Surface:** direct database access
 - **Expected:** Every statement rejected; the record is unchanged
 - **Result:** DEFENDED
 - **Stopped by:** BEFORE UPDATE / BEFORE DELETE triggers RAISE(ABORT)
-- **What the system said:** 4/4 statements aborted; 138 entries intact (audit_log is append-only: UPDATE is not permitted)
+- **What the system said:** 4/4 statements aborted; 165 entries intact (audit_log is append-only: UPDATE is not permitted)
 - **Money actions caused:** 0 (intended: 0)
 

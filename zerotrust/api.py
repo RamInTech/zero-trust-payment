@@ -23,6 +23,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from zerotrust.checkout import CheckoutError, CheckoutService
+from zerotrust.provider import ProviderTimeout
 
 _CODE_STATUS = {
     "ITEM_NOT_IN_CATALOG": 404,
@@ -113,6 +114,24 @@ def create_app(checkout: CheckoutService) -> FastAPI:
     def confirm_intent(request_id: str, body: ConfirmRequest = ConfirmRequest()):
         try:
             outcome = checkout.confirm(request_id, body.amount_paise)
+        except ProviderTimeout as exc:
+            # The outcome is UNKNOWN, not failed. 503 rather than 500: the
+            # request is not erroneous, it is unresolved. The body says so
+            # explicitly, because a client that reads this as a failure and
+            # retries with a fresh intent is how a timeout becomes a double
+            # charge. The record is frozen until reconciliation resolves it.
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "PENDING_VERIFICATION",
+                    "reason": str(exc),
+                    "guidance": (
+                        "the outcome of this purchase is unknown and is "
+                        "awaiting reconciliation; do NOT resubmit it as a new "
+                        "purchase"
+                    ),
+                },
+            )
         except CheckoutError as exc:
             _fail(exc)
 
