@@ -1,0 +1,116 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * A light, flat fintech palette in the spirit of Razorpay's own product
+ * surfaces: navy type, a single confident blue, generous whitespace, and
+ * borders doing the work that shadows and glass were doing before.
+ *
+ * This project is NOT Razorpay. It is built on their test-mode API for their
+ * buildathon. No Razorpay logo, wordmark or domain is used here.
+ */
+
+@layer base {
+  :root {
+    --background: 210 33% 98%;
+    --foreground: 222 47% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --muted: 210 30% 96%;
+    --muted-foreground: 217 14% 42%;
+    --border: 214 24% 90%;
+    --input: 214 24% 88%;
+    --primary: 213 100% 60%;
+    --primary-foreground: 0 0% 100%;
+    --ring: 213 100% 60%;
+    --navy: 222 60% 14%;
+    --accent: 259 84% 60%;
+    --ok: 145 63% 37%;
+    --warn: 32 90% 44%;
+    --danger: 351 78% 48%;
+    --radius: 0.6rem;
+  }
+
+  * { @apply border-border; }
+
+  html { -webkit-text-size-adjust: 100%; }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "cv02", "cv03", "cv04", "ss01";
+    letter-spacing: -0.011em;
+  }
+
+  h1, h2, h3 { letter-spacing: -0.021em; }
+
+  :focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
+
+  ::selection { background: hsl(var(--primary) / 0.16); }
+
+  ::-webkit-scrollbar { width: 11px; height: 11px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: hsl(214 18% 82%); border-radius: 99px;
+    border: 3px solid transparent; background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover { background: hsl(214 16% 72%); background-clip: content-box; }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.001ms !important;
+      transition-duration: 0.001ms !important;
+    }
+  }
+}
+
+@layer components {
+  /* A plain, honest card. No blur, no gradient scrim. */
+  .surface {
+    @apply border bg-card;
+    box-shadow: 0 1px 2px hsl(222 47% 11% / 0.04);
+  }
+
+  .surface-hover {
+    transition: box-shadow 180ms ease, border-color 180ms ease;
+  }
+  .surface-hover:hover {
+    border-color: hsl(214 20% 84%);
+    box-shadow: 0 2px 8px hsl(222 47% 11% / 0.07);
+  }
+
+  /* Inset regions: tables, evidence blocks, code. */
+  .subtle { @apply border border-border bg-muted/60; }
+
+  .mono {
+    @apply font-mono text-[12px] leading-relaxed;
+    letter-spacing: -0.012em;
+  }
+
+  .display {
+    @apply text-[26px] font-semibold tabular-nums text-[hsl(var(--navy))];
+    letter-spacing: -0.028em;
+  }
+
+  .eyebrow {
+    @apply text-[11px] font-semibold uppercase tracking-[0.075em] text-muted-foreground;
+  }
+
+  .pulse-dot { position: relative; }
+  .pulse-dot::before {
+    content: "";
+    position: absolute;
+    inset: -4px;
+    border-radius: 999px;
+    background: currentColor;
+    opacity: 0.25;
+    animation: pulse-ring 2.4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  }
+  @keyframes pulse-ring {
+    0%   { transform: scale(0.7); opacity: 0.3; }
+    70%  { transform: scale(1.45); opacity: 0; }
+    100% { transform: scale(1.45); opacity: 0; }
+  }
+}
