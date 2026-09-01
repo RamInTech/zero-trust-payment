@@ -3,7 +3,7 @@
 This wraps the production app rather than extending it:
 
     demo = FastAPI()
-    demo.mount("/api", create_app(checkout))   # unmodified
+    demo.mount("/api", create_app(checkout, narrator=narrator))   # unmodified
 
 `zerotrust/api.py` gains nothing from this module -- not one route. The reason
 is the same one that kept FastAPI thin in the first place: a rule that lives in
@@ -110,6 +110,8 @@ def create_demo_app(
     catalog: Catalog,
     agent_id: str = "agent_alpha",
     faults: Optional[FaultInjector] = None,
+    scheduler=None,
+    narrator=None,
 ) -> FastAPI:
     demo = FastAPI(
         title="Zero-Trust Payment Authorization — reference client",
@@ -119,7 +121,7 @@ def create_demo_app(
             "policy engine behind that API."
         ),
     )
-    demo.mount("/api", create_app(checkout))
+    demo.mount("/api", create_app(checkout, narrator=narrator))
 
     index_html = FRONTEND_DIST / "index.html"
     if index_html.exists():
@@ -342,6 +344,23 @@ def create_demo_app(
             created_at=now,
         ))
         return {"agent_id": new_id, "velocity_limit": template.velocity_limit}
+
+    @demo.get("/demo/sweep")
+    def sweep_status():
+        """What the periodic reconciliation sweep has been doing."""
+        if scheduler is None:
+            return {"running": False, "cycles": 0, "last_cycle": None,
+                    "records_resolved": {}, "errors": 0,
+                    "note": "no scheduler in this stack"}
+        return scheduler.status()
+
+    @demo.post("/demo/sweep/run")
+    def sweep_now():
+        """Run one sweep immediately, rather than waiting for the interval."""
+        if scheduler is None:
+            raise HTTPException(status_code=501,
+                                detail={"reason": "no scheduler in this stack"})
+        return scheduler.run_once().as_dict()
 
     @demo.get("/demo/stats")
     def stats():
