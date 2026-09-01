@@ -300,7 +300,12 @@ class AdversarialSuite:
         before = self.charge_count
         # Its own agent, with a full, untouched velocity budget. Sharing an
         # agent here is what made this attack report a phantom breach.
-        agent = self._agent("burst")
+        #
+        # Cool-down is disabled for this agent on purpose: with it on, the
+        # later denials in a 12-request burst come back as COOLDOWN_ACTIVE
+        # rather than VELOCITY_EXCEEDED, and the row would be measuring two
+        # protections at once. Cool-down has its own attack below.
+        agent = self._agent("burst", cooldown_denials=0)
         attempts = 12
         pendings = [self._display("SKU-TEA", agent) for _ in range(attempts)]
         barrier = threading.Barrier(attempts)
@@ -514,6 +519,49 @@ class AdversarialSuite:
             intended_actions=0,
         )
 
+    def attack_denial_cooldown(self) -> AttackOutcome:
+        """Grind against the policy engine and get throttled for it.
+
+        Every individual denial here is correct. The point of the cool-down is
+        that a stream of them is itself a signal: an agent probing the boundary
+        should be refused before the engine keeps evaluating its requests.
+        """
+        before = self.charge_count
+        agent = self._agent("grinder", cooldown_denials=3,
+                            cooldown_window_secs=300.0)
+
+        rules = []
+        for i in range(8):
+            pending = self._display("SKU-MUG", agent)  # never allowed
+            if not pending:
+                rules.append("REJECTED_AT_CATALOG")
+                continue
+            body = self._confirm(pending["request_id"]).json()
+            rules.append(body.get("rule"))
+
+        # A legitimate request, once throttled, is still refused.
+        allowed = self._display("SKU-COFFEE", agent)
+        after = self._confirm(allowed["request_id"]).json()
+        caused = self.charge_count - before
+
+        throttled = [r for r in rules if r == "COOLDOWN_ACTIVE"]
+        return AttackOutcome(
+            name="grind_against_the_policy_engine",
+            attack="Probe the policy engine with 8 disallowed purchases, then "
+                   "submit a valid one",
+            surface="HTTP API",
+            expected="The agent is throttled after its threshold, and the "
+                     "valid request is refused while the cool-down holds",
+            defended=(len(throttled) > 0
+                      and after.get("rule") == "COOLDOWN_ACTIVE"
+                      and caused == 0),
+            defence="Policy engine: COOLDOWN_ACTIVE (repeated-denial throttle)",
+            evidence=f"{len(throttled)} of 8 probes throttled; the following "
+                     f"valid request returned {after.get('rule')}",
+            money_actions=caused,
+            intended_actions=0,
+        )
+
     def attack_audit_tampering(self) -> AttackOutcome:
         """Erase the evidence after being denied."""
         import sqlite3
@@ -598,6 +646,7 @@ class AdversarialSuite:
         "attack_expired_mandate",
         "attack_unknown_item",
         "attack_retry_after_timeout",
+        "attack_denial_cooldown",
         "attack_audit_tampering",
     ]
 

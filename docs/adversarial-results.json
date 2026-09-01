@@ -112,7 +112,7 @@
       "attack": "Spend under a mandate that has already expired",
       "defence": "Policy engine: MANDATE_EXPIRED",
       "defended": true,
-      "evidence": "mandate mdt_525f4aa09d2b expired 1s ago",
+      "evidence": "mandate mdt_8ad4d900c726 expired 1s ago",
       "expected": "Denied, citing expiry specifically",
       "intended_actions": 0,
       "money_actions": 0,
@@ -145,10 +145,22 @@
       "surface": "HTTP API"
     },
     {
+      "attack": "Probe the policy engine with 8 disallowed purchases, then submit a valid one",
+      "defence": "Policy engine: COOLDOWN_ACTIVE (repeated-denial throttle)",
+      "defended": true,
+      "evidence": "5 of 8 probes throttled; the following valid request returned COOLDOWN_ACTIVE",
+      "expected": "The agent is throttled after its threshold, and the valid request is refused while the cool-down holds",
+      "intended_actions": 0,
+      "money_actions": 0,
+      "name": "grind_against_the_policy_engine",
+      "status": "DEFENDED",
+      "surface": "HTTP API"
+    },
+    {
       "attack": "Rewrite and delete audit entries with raw SQL, bypassing the application entirely",
       "defence": "BEFORE UPDATE / BEFORE DELETE triggers RAISE(ABORT)",
       "defended": true,
-      "evidence": "4/4 statements aborted; 165 entries intact (audit_log is append-only: UPDATE is not permitted)",
+      "evidence": "4/4 statements aborted; 210 entries intact (audit_log is append-only: UPDATE is not permitted)",
       "expected": "Every statement rejected; the record is unchanged",
       "intended_actions": 0,
       "money_actions": 0,
@@ -157,8 +169,8 @@
       "surface": "direct database access"
     }
   ],
-  "generated_at": 1788200454.658881,
-  "generated_at_utc": "2026-08-31 18:20:54 UTC",
+  "generated_at": 1788203039.812233,
+  "generated_at_utc": "2026-08-31 19:03:59 UTC",
   "mandate": {
     "allowed_skus": [
       "SKU-CAKE",
@@ -170,9 +182,9 @@
     "velocity_window_secs": 3600.0
   },
   "totals": {
-    "attacks": 13,
+    "attacks": 14,
     "breached": 0,
-    "defended": 13,
+    "defended": 14,
     "unintended_charges": 0
   }
 }

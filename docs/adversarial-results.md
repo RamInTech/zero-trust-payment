@@ -3,9 +3,9 @@
 
 # Adversarial Suite Results
 
-Generated: 2026-08-31 18:20:54 UTC
+Generated: 2026-08-31 19:03:59 UTC
 
-**13 of 13 attacks defended. 0 unintended charges.**
+**14 of 14 attacks defended. 0 unintended charges.**
 
 Every attack below was run against a live stack through the HTTP API, under this mandate:
 
@@ -27,7 +27,8 @@ Every attack below was run against a live stack through the HTTP API, under this
 | 10 | Spend under a mandate that has already expired | DEFENDED | Policy engine: MANDATE_EXPIRED | 0 |
 | 11 | Purchase a SKU that is not in the catalog at all | DEFENDED | Catalog lookup precedes the policy engine | 0 |
 | 12 | Cause a payment timeout, then retry it 5 times to force a second charge | DEFENDED | PENDING_VERIFICATION freezes the record; the claim refuses and staleness will not reclaim it | 0 |
-| 13 | Rewrite and delete audit entries with raw SQL, bypassing the application entirely | DEFENDED | BEFORE UPDATE / BEFORE DELETE triggers RAISE(ABORT) | 0 |
+| 13 | Probe the policy engine with 8 disallowed purchases, then submit a valid one | DEFENDED | Policy engine: COOLDOWN_ACTIVE (repeated-denial throttle) | 0 |
+| 14 | Rewrite and delete audit entries with raw SQL, bypassing the application entirely | DEFENDED | BEFORE UPDATE / BEFORE DELETE triggers RAISE(ABORT) | 0 |
 
 ## Evidence
 
@@ -128,7 +129,7 @@ Every attack below was run against a live stack through the HTTP API, under this
 - **Expected:** Denied, citing expiry specifically
 - **Result:** DEFENDED
 - **Stopped by:** Policy engine: MANDATE_EXPIRED
-- **What the system said:** mandate mdt_525f4aa09d2b expired 1s ago
+- **What the system said:** mandate mdt_8ad4d900c726 expired 1s ago
 - **Money actions caused:** 0 (intended: 0)
 
 ### 11. purchase_nonexistent_item
@@ -151,13 +152,23 @@ Every attack below was run against a live stack through the HTTP API, under this
 - **What the system said:** HTTP 503 on the timeout; retries returned {'AWAITING_VERIFICATION'}; velocity slot held=True
 - **Money actions caused:** 0 (intended: 0)
 
-### 13. erase_the_audit_trail
+### 13. grind_against_the_policy_engine
+
+- **Attack:** Probe the policy engine with 8 disallowed purchases, then submit a valid one
+- **Surface:** HTTP API
+- **Expected:** The agent is throttled after its threshold, and the valid request is refused while the cool-down holds
+- **Result:** DEFENDED
+- **Stopped by:** Policy engine: COOLDOWN_ACTIVE (repeated-denial throttle)
+- **What the system said:** 5 of 8 probes throttled; the following valid request returned COOLDOWN_ACTIVE
+- **Money actions caused:** 0 (intended: 0)
+
+### 14. erase_the_audit_trail
 
 - **Attack:** Rewrite and delete audit entries with raw SQL, bypassing the application entirely
 - **Surface:** direct database access
 - **Expected:** Every statement rejected; the record is unchanged
 - **Result:** DEFENDED
 - **Stopped by:** BEFORE UPDATE / BEFORE DELETE triggers RAISE(ABORT)
-- **What the system said:** 4/4 statements aborted; 165 entries intact (audit_log is append-only: UPDATE is not permitted)
+- **What the system said:** 4/4 statements aborted; 210 entries intact (audit_log is append-only: UPDATE is not permitted)
 - **Money actions caused:** 0 (intended: 0)
 

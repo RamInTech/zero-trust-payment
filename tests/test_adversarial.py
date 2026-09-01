@@ -29,6 +29,9 @@ REQUIRED_COVERAGE = {
         "velocity_burst",
     "two valid purchases racing -> both succeed independently":
         "concurrent_distinct_purchases",
+    # Beyond Phase 6's required six: added with the Section 8 stretch goals.
+    "repeated denials -> the agent is throttled":
+        "grind_against_the_policy_engine",
 }
 
 
