@@ -24,16 +24,25 @@ from zerotrust.gateway import PurchaseGateway
 from zerotrust.idempotency import IdempotencyStore
 from zerotrust.intent import RuleBasedIntentParser
 from zerotrust.mandate import Mandate, MandateStore
+from zerotrust.narrate import TemplateNarrator
 from zerotrust.policy import PolicyEngine
-from zerotrust.provider import ProviderTimeout
+from zerotrust.provider import ProviderTimeout, SimulatedProvider
+from zerotrust.reconcile import ReconciliationScheduler, Reconciler
 
 HOUR = 3600.0
 AGENT = "agent_alpha"
+SWEEP_INTERVAL_SECONDS = 20.0
+
+
+def _receipt(request) -> str:
+    """One receipt per idempotency key, so the sweep can find the order again."""
+    return f"ui_{request.idempotency_key[:18]}"
 DBS = {"audit": "ui_audit.db", "policy": "ui_policy.db", "idem": "ui_idem.db"}
 
 
 def build(live: bool):
     catalog = demo_catalog()
+    offline_provider = SimulatedProvider()
     audit = AuditLog(DBS["audit"])
     engine = PolicyEngine(MandateStore(DBS["policy"]))
     store = IdempotencyStore(DBS["idem"])
@@ -62,8 +71,7 @@ def build(live: bool):
                 raise ProviderTimeout(
                     "order creation timed out; the order may or may not exist")
             return provider.create_order(
-                request.amount_paise, "INR",
-                receipt=f"ui_{request.idempotency_key[:18]}")
+                request.amount_paise, "INR", receipt=_receipt(request))
     else:
         counter = {"n": 0}
 
@@ -72,15 +80,28 @@ def build(live: bool):
                 raise ProviderTimeout(
                     "order creation timed out; the order may or may not exist")
             counter["n"] += 1
-            return {"order_id": f"order_STUB{counter['n']:06d}",
-                    "amount": request.amount_paise}
+            return offline_provider.create_order(
+                request.amount_paise, receipt=_receipt(request))
 
     gateway = PurchaseGateway(engine, store, execute, audit=audit)
     checkout = CheckoutService(catalog, gateway,
                                parser=RuleBasedIntentParser(catalog),
                                audit=audit)
+
+    # The periodic sweep, so a purchase whose outcome is unknown resolves
+    # itself instead of waiting for somebody to notice.
+    reconciler = Reconciler(
+        provider if live else offline_provider, store, audit=audit,
+        policy=engine)
+    scheduler = ReconciliationScheduler(
+        reconciler,
+        receipt_for=lambda scoped: f"ui_{scoped.split(':', 1)[-1][:18]}",
+        interval_seconds=SWEEP_INTERVAL_SECONDS,
+    ).start()
+
     return create_demo_app(checkout, engine, audit, catalog, agent_id=AGENT,
-                           faults=faults)
+                           faults=faults, scheduler=scheduler,
+                           narrator=TemplateNarrator())
 
 
 def main() -> int:
@@ -90,6 +111,7 @@ def main() -> int:
 
     print("\n  Reference client on http://127.0.0.1:8000")
     print("  The API it demonstrates is mounted at /api")
+    print(f"  Reconciliation sweep running every {SWEEP_INTERVAL_SECONDS:.0f}s")
     if not (FRONTEND_DIST / "index.html").exists():
         print("\n  NOTE: the frontend is not built. Run:")
         print("        cd frontend && npm install && npm run build")

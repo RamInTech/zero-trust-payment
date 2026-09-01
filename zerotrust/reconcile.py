@@ -32,6 +32,7 @@ repair that guesses is worse than a divergence that is visible.
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -318,3 +319,135 @@ class Reconciler:
                 "provider_order_ids": [o.get("id") for o in result.provider_orders],
             },
         )
+
+
+@dataclass
+class SweepCycle:
+    """What one pass of the scheduler did."""
+
+    started_at: float
+    finished_at: float
+    records_seen: int
+    findings: dict = field(default_factory=dict)
+    error: Optional[str] = None
+
+    def as_dict(self) -> dict:
+        return {
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "records_seen": self.records_seen,
+            "findings": self.findings,
+            "error": self.error,
+        }
+
+
+class ReconciliationScheduler:
+    """Runs `Reconciler.sweep()` on an interval, so nothing waits for a human.
+
+    Phase 7 built detection and repair but never scheduled them, which meant a
+    record whose outcome was unknown sat frozen until somebody thought to look.
+    The purchase was safe -- retries are refused -- but it was also stuck, and
+    its velocity slot stayed held.
+
+    Two properties matter more than the timing:
+
+    NEVER OVERLAPPING. One sweep runs at a time. A provider that answers slowly
+    must not cause sweeps to stack up behind each other, each re-reconciling
+    records the last one is still working through.
+
+    NEVER FATAL. An exception inside a cycle is recorded and the loop
+    continues. A scheduler that dies on the first provider blip is worse than
+    no scheduler, because its absence is silent -- everything looks fine while
+    nothing is being reconciled.
+    """
+
+    def __init__(
+        self,
+        reconciler: "Reconciler",
+        receipt_for: Callable[[str], str],
+        interval_seconds: float = 60.0,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self.reconciler = reconciler
+        self.receipt_for = receipt_for
+        self.interval_seconds = interval_seconds
+        self._clock = clock
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+        self.cycles: list[SweepCycle] = []
+
+    # -- one pass ----------------------------------------------------------
+
+    def run_once(self) -> SweepCycle:
+        """Reconcile everything currently pending. Safe to call directly."""
+        started = self._clock()
+        findings: dict = {}
+        error = None
+        seen = 0
+        try:
+            results = self.reconciler.sweep(self.receipt_for)
+            seen = len(results)
+            for result in results:
+                key = result.finding.value
+                findings[key] = findings.get(key, 0) + 1
+        except Exception as exc:  # noqa: BLE001 - deliberately broad; see above
+            error = f"{type(exc).__name__}: {exc}"
+
+        cycle = SweepCycle(started_at=started, finished_at=self._clock(),
+                           records_seen=seen, findings=findings, error=error)
+        with self._lock:
+            self.cycles.append(cycle)
+        return cycle
+
+    # -- the loop ----------------------------------------------------------
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            self.run_once()
+            # Event.wait doubles as the sleep and the shutdown signal, so
+            # stopping does not have to wait out a full interval.
+            self._stop.wait(self.interval_seconds)
+
+    def start(self) -> "ReconciliationScheduler":
+        if self._thread and self._thread.is_alive():
+            return self
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="reconciliation-sweep")
+        self._thread.start()
+        return self
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=timeout)
+            self._thread = None
+
+    @property
+    def running(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
+    def __enter__(self) -> "ReconciliationScheduler":
+        return self.start()
+
+    def __exit__(self, *exc_info) -> None:
+        self.stop()
+
+    # -- what it has done --------------------------------------------------
+
+    def status(self) -> dict:
+        with self._lock:
+            cycles = list(self.cycles)
+        totals: dict = {}
+        for cycle in cycles:
+            for finding, count in cycle.findings.items():
+                totals[finding] = totals.get(finding, 0) + count
+        return {
+            "running": self.running,
+            "interval_seconds": self.interval_seconds,
+            "cycles": len(cycles),
+            "last_cycle": cycles[-1].as_dict() if cycles else None,
+            "records_resolved": totals,
+            "errors": sum(1 for c in cycles if c.error),
+        }
