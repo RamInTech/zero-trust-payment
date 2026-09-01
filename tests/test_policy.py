@@ -385,3 +385,132 @@ def test_concurrent_burst_cannot_exceed_the_velocity_limit(tmp_path, run):
         if d.denied:
             assert d.rule is Rule.VELOCITY_EXCEEDED
     assert engine.slots_used("agent_burst", HOUR) == 3
+
+
+# -- denial cool-down (stretch goal, Tier 2) ------------------------------
+
+def cooldown_mandate(engine, clock, denials=3, window=300.0):
+    return engine.mandates.issue(Mandate(
+        agent_id="agent_grind",
+        max_amount_paise=50_000,
+        allowed_skus=frozenset({"SKU-COFFEE"}),
+        expires_at=clock() + MANDATE_TTL,
+        velocity_limit=10,
+        velocity_window_secs=HOUR,
+        cooldown_denials=denials,
+        cooldown_window_secs=window,
+        created_at=clock(),
+    ))
+
+
+def grind(engine, n, sku="SKU-BANNED"):
+    """Provoke `n` denials from the same agent."""
+    return [
+        engine.evaluate(PurchaseRequest("agent_grind", sku, 10_000, f"k{i}"))
+        for i in range(n)
+    ]
+
+
+def test_repeated_denials_trigger_a_cooldown(engine, clock):
+    cooldown_mandate(engine, clock, denials=3)
+
+    first_three = grind(engine, 3)
+    assert all(d.rule is Rule.SKU_NOT_ALLOWED for d in first_three)
+
+    fourth = engine.evaluate(
+        PurchaseRequest("agent_grind", "SKU-COFFEE", 10_000, "ok"))
+    assert fourth.rule is Rule.COOLDOWN_ACTIVE
+    assert "cool-down" in fourth.reason
+    assert fourth.details["denials"] == 3
+    assert fourth.details["threshold"] == 3
+
+
+def test_cooldown_refuses_requests_that_would_otherwise_pass(engine, clock):
+    """The throttle runs before the rules, so a valid request is still refused."""
+    cooldown_mandate(engine, clock, denials=2)
+    grind(engine, 2)
+
+    valid = engine.evaluate(
+        PurchaseRequest("agent_grind", "SKU-COFFEE", 10_000, "valid"))
+    assert valid.denied
+    assert valid.rule is Rule.COOLDOWN_ACTIVE
+
+
+def test_a_cooldown_denial_does_not_extend_the_cooldown(engine, clock):
+    """The detail that makes the throttle terminate.
+
+    If COOLDOWN_ACTIVE denials counted toward the threshold, every refusal
+    would renew the window and the agent could never leave it -- a permanent
+    ban wearing a rate limit's clothes.
+    """
+    cooldown_mandate(engine, clock, denials=2, window=300.0)
+    grind(engine, 2)
+
+    # Hammer while throttled; none of these may count.
+    for i in range(10):
+        blocked = engine.evaluate(
+            PurchaseRequest("agent_grind", "SKU-COFFEE", 10_000, f"h{i}"))
+        assert blocked.rule is Rule.COOLDOWN_ACTIVE
+
+    assert engine.denials_in_window("agent_grind", 300.0) == 2
+
+    clock.advance(301.0)
+    recovered = engine.evaluate(
+        PurchaseRequest("agent_grind", "SKU-COFFEE", 10_000, "after"))
+    assert recovered.approved, "the agent never escaped the cool-down"
+
+
+def test_the_cooldown_window_slides(engine, clock):
+    cooldown_mandate(engine, clock, denials=3, window=300.0)
+    grind(engine, 3)
+    assert engine.evaluate(
+        PurchaseRequest("agent_grind", "SKU-COFFEE", 10_000, "x")
+    ).rule is Rule.COOLDOWN_ACTIVE
+
+    clock.advance(301.0)
+    assert engine.evaluate(
+        PurchaseRequest("agent_grind", "SKU-COFFEE", 10_000, "y")).approved
+
+
+def test_cooldown_reports_a_retry_after(engine, clock):
+    cooldown_mandate(engine, clock, denials=2, window=300.0)
+    grind(engine, 2)
+    clock.advance(100.0)
+
+    blocked = engine.evaluate(
+        PurchaseRequest("agent_grind", "SKU-COFFEE", 10_000, "z"))
+    assert 195 <= blocked.details["retry_after_secs"] <= 205
+
+
+def test_cooldown_is_isolated_between_agents(engine, clock, mandate):
+    """One agent's throttle must not touch another's."""
+    cooldown_mandate(engine, clock, denials=2)
+    grind(engine, 2)
+    assert engine.evaluate(
+        PurchaseRequest("agent_grind", "SKU-COFFEE", 10_000, "a")
+    ).rule is Rule.COOLDOWN_ACTIVE
+
+    # agent_1 has its own mandate and has been denied nothing.
+    assert engine.evaluate(req()).approved
+
+
+def test_cooldown_can_be_disabled(engine, clock):
+    engine.mandates.issue(Mandate(
+        agent_id="agent_grind", max_amount_paise=50_000,
+        allowed_skus=frozenset({"SKU-COFFEE"}),
+        expires_at=clock() + MANDATE_TTL, velocity_limit=10,
+        velocity_window_secs=HOUR, cooldown_denials=0, created_at=clock()))
+
+    grind(engine, 8)
+    assert engine.evaluate(
+        PurchaseRequest("agent_grind", "SKU-COFFEE", 10_000, "still")).approved
+
+
+def test_malformed_input_is_still_judged_before_the_cooldown(engine, clock):
+    """Bad input is not a policy question, and stays reported as bad input."""
+    cooldown_mandate(engine, clock, denials=2)
+    grind(engine, 2)
+
+    decision = engine.evaluate(
+        PurchaseRequest("agent_grind", "SKU-COFFEE", -1, "bad"))
+    assert decision.rule is Rule.MALFORMED_REQUEST
