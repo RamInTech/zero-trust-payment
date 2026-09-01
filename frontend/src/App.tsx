@@ -31,17 +31,20 @@ export default function App() {
   const [layers, setLayers] = useState<Json | null>(null)
   const [adversarial, setAdversarial] = useState<Json | null>(null)
   const [config, setConfig] = useState<DemoConfig | null>(null)
+  const [sweep, setSweep] = useState<Json | null>(null)
   const [tab, setTab] = useState("chat")
 
   const refresh = useCallback(async (who = agent) => {
-    const [m, s, a, t, l] = await Promise.all([
+    const [m, s, a, t, l, w] = await Promise.all([
       api.mandate(who), api.stats(), api.audit(), api.transactions(), api.layers(),
+      api.sweep(),
     ])
     if (m.ok) setMandate(m.body)
     if (s.ok) setStats(s.body)
     if (a.ok) setAudit(a.body.events)
     if (t.ok) setTransactions(t.body.transactions)
     if (l.ok) setLayers(l.body)
+    if (w.ok) setSweep(w.body)
   }, [agent])
 
   useEffect(() => {
@@ -133,7 +136,7 @@ export default function App() {
                 <Chat agent={agent} config={config} onChanged={() => refresh()} />
               </TabsContent>
               <TabsContent value="dashboard" className="focus-visible:outline-none">
-                <Dashboard mandate={mandate} stats={stats} audit={audit} />
+                <Dashboard mandate={mandate} stats={stats} audit={audit} sweep={sweep} />
               </TabsContent>
               <TabsContent value="checkout" className="focus-visible:outline-none">
                 <Checkout agent={agent} catalog={catalog} onChanged={() => refresh()} />

@@ -33,8 +33,8 @@ function Stat({ label, value, hint, accent }: {
 }
 
 export function Dashboard({
-  mandate, stats, audit,
-}: { mandate: Json | null; stats: Json | null; audit: Json[] }) {
+  mandate, stats, audit, sweep,
+}: { mandate: Json | null; stats: Json | null; audit: Json[]; sweep: Json | null }) {
   const denials = (stats?.denials ?? {}) as Record<string, number>
   const expiryHours = mandate ? Math.floor(mandate.seconds_until_expiry / 3600) : 0
   const expiryMins = mandate ? Math.floor((mandate.seconds_until_expiry % 3600) / 60) : 0
@@ -70,6 +70,17 @@ export function Dashboard({
             <div className="grid gap-4 sm:grid-cols-2">
               <Stat label="Max per transaction" value={rupees(mandate.max_amount_paise)} accent />
               <Stat label="Expires" value={mandate.expired ? "expired" : `${expiryHours}h ${expiryMins}m`} />
+              {mandate.cooldown_denials > 0 && (
+                <div className="sm:col-span-2 rounded-md border border-border bg-muted/40 px-4 py-3">
+                  <div className="text-[10px] font-medium uppercase tracking-[0.13em] text-muted-foreground">
+                    Denial cool-down
+                  </div>
+                  <p className="mono mt-1 text-muted-foreground">
+                    throttled after {mandate.cooldown_denials} denials in{" "}
+                    {Math.round(mandate.cooldown_window_secs / 60)} min
+                  </p>
+                </div>
+              )}
               <div className="sm:col-span-2 rounded-md border border-border bg-muted/50 px-4 py-3">
                 <div className="text-[10.5px] uppercase tracking-[0.08em] text-muted-foreground">Velocity</div>
                 <div className="mt-2"><VelocityDots used={mandate.velocity_used} limit={mandate.velocity_limit} /></div>
@@ -132,6 +143,38 @@ export function Dashboard({
                 )
               })}
             </ul>
+          )}
+        </CardContent>
+      </Card>
+      </motion.div>
+
+      <motion.div variants={item}>
+      <Card className="h-full">
+        <CardHeader><CardTitle>Reconciliation sweep</CardTitle></CardHeader>
+        <CardContent className="grid gap-2 text-[12.5px]">
+          {!sweep ? (
+            <p className="text-muted-foreground">not running</p>
+          ) : (
+            <>
+              <div className="flex items-center justify-between">
+                <span className="text-muted-foreground">status</span>
+                <Badge variant={sweep.running ? "ok" : "default"} dot={sweep.running}>
+                  {sweep.running ? `every ${Math.round(sweep.interval_seconds)}s` : "stopped"}
+                </Badge>
+              </div>
+              <div className="mono flex justify-between text-muted-foreground">
+                <span>cycles</span><span className="tabular-nums text-foreground">{sweep.cycles}</span>
+              </div>
+              <div className="mono flex justify-between text-muted-foreground">
+                <span>errors</span><span className="tabular-nums text-foreground">{sweep.errors}</span>
+              </div>
+              {Object.entries(sweep.records_resolved ?? {}).map(([k, v]) => (
+                <div key={k} className="mono flex justify-between text-muted-foreground">
+                  <span>{k.toLowerCase().replace(/_/g, " ")}</span>
+                  <span className="tabular-nums text-foreground">{String(v)}</span>
+                </div>
+              ))}
+            </>
           )}
         </CardContent>
       </Card>

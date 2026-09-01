@@ -15,14 +15,14 @@ const TONE: Record<string, "ok" | "danger" | "warn" | "default" | "info"> = {
 
 export function Transactions({ transactions }: { transactions: Json[] }) {
   const [open, setOpen] = useState<string | null>(null)
-  const [events, setEvents] = useState<Record<string, Json[]>>({})
+  const [explained, setExplained] = useState<Record<string, Json>>({})
 
   async function toggle(requestId: string) {
     if (open === requestId) { setOpen(null); return }
     setOpen(requestId)
-    if (!events[requestId]) {
-      const res = await api.auditFor(requestId)
-      if (res.ok) setEvents(prev => ({ ...prev, [requestId]: res.body.events }))
+    if (!explained[requestId]) {
+      const res = await api.explain(requestId)
+      if (res.ok) setExplained(prev => ({ ...prev, [requestId]: res.body }))
     }
   }
 
@@ -68,24 +68,12 @@ export function Transactions({ transactions }: { transactions: Json[] }) {
                         transition={{ duration: 0.24, ease: [0.22, 1, 0.36, 1] }}
                         className="overflow-hidden"
                       >
-                        <div className="border-t border-border px-3 py-2.5">
-                          <dl className="mono mb-2 grid grid-cols-[92px_1fr] gap-x-3 text-muted-foreground">
-                            <dt>request</dt><dd>{t.request_id}</dd>
-                            <dt>key</dt><dd>{t.idempotency_key ?? "—"}</dd>
-                            {t.reason && (<><dt>reason</dt><dd className="text-foreground/80">{t.reason}</dd></>)}
-                          </dl>
-                          <ul className="grid gap-0.5 border-l border-border pl-3">
-                            {(events[t.request_id] ?? []).map(e => (
-                              <li key={e.event_id} className="mono grid grid-cols-[190px_96px_1fr] gap-2">
-                                <span>{e.event_type}</span>
-                                <ActorTag actor={e.actor} />
-                                <span className="truncate text-muted-foreground">{e.rule ?? e.reason ?? ""}</span>
-                              </li>
-                            ))}
-                            {!events[t.request_id] && (
-                              <li className="mono text-muted-foreground">loading…</li>
-                            )}
-                          </ul>
+                        <div className="border-t border-border px-4 py-3">
+                          {!explained[t.request_id] ? (
+                            <p className="mono text-muted-foreground">loading…</p>
+                          ) : (
+                            <Explanation data={explained[t.request_id]} />
+                          )}
                         </div>
                       </motion.div>
                     )}
@@ -97,5 +85,70 @@ export function Transactions({ transactions }: { transactions: Json[] }) {
         </CardContent>
       </Card>
     </motion.div>
+  )
+}
+
+
+/** WHY / WHAT / EVIDENCE, straight from GET /api/explain/{request_id}. */
+function Explanation({ data }: { data: Json }) {
+  const { what, why, evidence } = data
+  return (
+    <div className="grid gap-3">
+      <section>
+        <h4 className="eyebrow mb-1.5">Why</h4>
+        <div className="rounded-md subtle px-3 py-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge variant={why.decision === "APPROVED" ? "ok"
+              : why.decision === "DENIED" ? "danger" : "default"}>
+              {why.decision}
+            </Badge>
+            {why.rule && <span className="mono text-danger">{why.rule}</span>}
+            {why.decided_by && <ActorTag actor={why.decided_by} />}
+          </div>
+          {why.reason && <p className="mt-1.5 text-[12.5px]">{why.reason}</p>}
+          {Object.keys(why.figures ?? {}).length > 0 && (
+            <dl className="mono mt-1.5 grid grid-cols-2 gap-x-4 text-muted-foreground">
+              {Object.entries(why.figures as Json).map(([k, v]) => (
+                <div key={k} className="flex justify-between gap-3">
+                  <dt>{k.replace(/_/g, " ")}</dt>
+                  <dd className="tabular-nums text-foreground">{String(v)}</dd>
+                </div>
+              ))}
+            </dl>
+          )}
+          {why.human_confirmed && (
+            <p className="mt-1.5 text-[11.5px] text-muted-foreground">
+              A human confirmed this. The decision above was made separately.
+            </p>
+          )}
+        </div>
+      </section>
+
+      <section>
+        <h4 className="eyebrow mb-1.5">What</h4>
+        <dl className="mono grid grid-cols-[104px_1fr] gap-x-3 rounded-md subtle px-3 py-2 text-muted-foreground">
+          <dt>agent</dt><dd className="text-foreground">{what.agent_id}</dd>
+          <dt>item</dt><dd className="text-foreground">{what.sku ?? "—"}</dd>
+          <dt>amount</dt><dd className="text-foreground">{rupees(what.amount_paise)}</dd>
+          <dt>key</dt><dd className="truncate text-foreground">{what.idempotency_key ?? "—"}</dd>
+          <dt>money moved</dt><dd className="text-foreground">{what.money_moved ? "yes" : "no"}</dd>
+        </dl>
+      </section>
+
+      <section>
+        <h4 className="eyebrow mb-1.5">Evidence</h4>
+        <ul className="grid gap-0.5 border-l border-border pl-3">
+          {(evidence as Json[]).map(e => (
+            <li key={e.event_id} className="mono grid grid-cols-[188px_92px_1fr] gap-2">
+              <span>{e.event_type}</span>
+              <ActorTag actor={e.actor} />
+              <span className="truncate text-muted-foreground">
+                {e.narrative ?? e.rule ?? e.reason ?? ""}
+              </span>
+            </li>
+          ))}
+        </ul>
+      </section>
+    </div>
   )
 }
