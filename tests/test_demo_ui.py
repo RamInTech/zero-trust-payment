@@ -33,6 +33,10 @@ AGENT = "agent_alpha"
 
 #: Every route the production app is allowed to expose. Written out in full so
 #: an accidental addition fails loudly rather than sliding in.
+#:
+#: `/explain/{request_id}` was added deliberately as a Section 8 stretch goal:
+#: it is a product feature, read-only, and authorises nothing. This list exists
+#: to catch additions nobody decided on -- not to freeze the API forever.
 PRODUCTION_ROUTES = {
     "/catalog",
     "/intents",
@@ -41,6 +45,7 @@ PRODUCTION_ROUTES = {
     "/intents/{request_id}/confirm",
     "/intents/{request_id}/decline",
     "/audit/{request_id}",
+    "/explain/{request_id}",
 }
 
 

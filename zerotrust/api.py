@@ -23,6 +23,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from zerotrust.checkout import CheckoutError, CheckoutService
+from zerotrust.explain import UnknownRequest, explain
+from zerotrust.narrate import ExplanationWriter
 from zerotrust.provider import ProviderTimeout
 
 _CODE_STATUS = {
@@ -58,7 +60,10 @@ class ConfirmRequest(BaseModel):
     amount_paise: Optional[int] = None
 
 
-def create_app(checkout: CheckoutService) -> FastAPI:
+def create_app(
+    checkout: CheckoutService,
+    narrator: Optional[ExplanationWriter] = None,
+) -> FastAPI:
     app = FastAPI(
         title="Zero-Trust Payment Authorization for AI Agents",
         description=(
@@ -156,6 +161,24 @@ def create_app(checkout: CheckoutService) -> FastAPI:
             "status": pending.status.value,
             "note": "declined -- no policy check, no execution, no charge",
         }
+
+    @app.get("/explain/{request_id}")
+    def explain_decision(request_id: str):
+        """Why this request was approved or denied, as WHY / WHAT / EVIDENCE.
+
+        Reconstructed from the audit log; it decides nothing and writes
+        nothing. Structured rather than prose so the answer can be asserted on
+        and rendered, not merely read.
+        """
+        if checkout.audit is None:
+            raise HTTPException(status_code=501,
+                                detail={"reason": "no audit log configured"})
+        try:
+            return explain(checkout.audit, request_id, narrator).as_dict()
+        except UnknownRequest as exc:
+            raise HTTPException(status_code=404,
+                                detail={"code": "UNKNOWN_REQUEST",
+                                        "reason": str(exc)}) from None
 
     @app.get("/audit/{request_id}")
     def read_audit(request_id: str):
