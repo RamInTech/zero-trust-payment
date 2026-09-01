@@ -16,6 +16,10 @@ Schema decisions (previously open item #1 in RAZORPAY.md):
     which Phase 6's adversarial suite would legitimately exploit.
   - Mandates live in SQLite alongside the idempotency store, because velocity
     counting needs durable purchase history anyway.
+  - The cool-down (repeated-denial throttling) is configured HERE rather than
+    on the engine, because every other per-agent boundary already lives on the
+    mandate. A merchant tunes one object, and one abusive agent's threshold
+    does not become everybody's.
 """
 
 from __future__ import annotations
@@ -37,6 +41,8 @@ CREATE TABLE IF NOT EXISTS mandates (
     expires_at            REAL NOT NULL,
     velocity_limit        INTEGER NOT NULL,
     velocity_window_secs  REAL NOT NULL,
+    cooldown_denials      INTEGER NOT NULL DEFAULT 5,
+    cooldown_window_secs  REAL NOT NULL DEFAULT 300.0,
     created_at            REAL NOT NULL,
     revoked_at            REAL
 );
@@ -52,6 +58,12 @@ class Mandate:
     expires_at: float
     velocity_limit: int
     velocity_window_secs: float = 3600.0
+    #: Repeated-denial throttle. After `cooldown_denials` denials inside
+    #: `cooldown_window_secs`, further requests are refused before the mandate
+    #: rules are even evaluated. Defaulted so mandates written before this
+    #: existed keep working unchanged.
+    cooldown_denials: int = 5
+    cooldown_window_secs: float = 300.0
     currency: str = "INR"
     mandate_id: str = field(default_factory=lambda: f"mdt_{uuid.uuid4().hex[:12]}")
     created_at: float = field(default_factory=time.time)
@@ -90,8 +102,9 @@ class MandateStore:
             conn.execute(
                 "INSERT INTO mandates (mandate_id, agent_id, max_amount_paise, "
                 "allowed_skus, currency, expires_at, velocity_limit, "
-                "velocity_window_secs, created_at, revoked_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "velocity_window_secs, cooldown_denials, cooldown_window_secs, "
+                "created_at, revoked_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     mandate.mandate_id,
                     mandate.agent_id,
@@ -101,6 +114,8 @@ class MandateStore:
                     mandate.expires_at,
                     mandate.velocity_limit,
                     mandate.velocity_window_secs,
+                    mandate.cooldown_denials,
+                    mandate.cooldown_window_secs,
                     mandate.created_at,
                     mandate.revoked_at,
                 ),
@@ -162,6 +177,8 @@ def _row_to_mandate(row: sqlite3.Row) -> Mandate:
         expires_at=row["expires_at"],
         velocity_limit=row["velocity_limit"],
         velocity_window_secs=row["velocity_window_secs"],
+        cooldown_denials=row["cooldown_denials"],
+        cooldown_window_secs=row["cooldown_window_secs"],
         created_at=row["created_at"],
         revoked_at=row["revoked_at"],
     )

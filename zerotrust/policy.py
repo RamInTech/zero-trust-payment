@@ -45,6 +45,10 @@ class Rule(str, Enum):
     SKU_NOT_ALLOWED = "SKU_NOT_ALLOWED"
     CURRENCY_MISMATCH = "CURRENCY_MISMATCH"
     VELOCITY_EXCEEDED = "VELOCITY_EXCEEDED"
+    #: The agent has been denied too often, too fast. Refused before the
+    #: mandate rules are evaluated -- an agent grinding against the policy
+    #: engine is throttled rather than merely denied over and over.
+    COOLDOWN_ACTIVE = "COOLDOWN_ACTIVE"
 
 
 @dataclass(frozen=True)
@@ -94,6 +98,15 @@ CREATE TABLE IF NOT EXISTS velocity_slots (
 );
 CREATE INDEX IF NOT EXISTS idx_slots_agent_time
     ON velocity_slots(agent_id, claimed_at);
+
+CREATE TABLE IF NOT EXISTS denials (
+    denial_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id   TEXT NOT NULL,
+    rule       TEXT NOT NULL,
+    denied_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_denials_agent_time
+    ON denials(agent_id, denied_at);
 """
 
 
@@ -141,6 +154,12 @@ class PolicyEngine:
                 Rule.NO_ACTIVE_MANDATE,
                 f"agent '{request.agent_id}' has no active mandate",
             )
+
+        # Throttling comes before the rules: an agent already in cool-down is
+        # refused without the engine bothering to evaluate the request.
+        cooling = self._check_cooldown(request, mandate, now)
+        if cooling:
+            return cooling
 
         for check in (self._check_expiry, self._check_amount,
                       self._check_sku, self._check_currency):
@@ -344,6 +363,80 @@ class PolicyEngine:
 
     # -- helper ------------------------------------------------------------
 
+    def _record_denial(self, agent_id: str, rule: Rule) -> None:
+        """Remember a denial, for the cool-down count.
+
+        Kept in the policy engine's own database rather than read back out of
+        the audit log: the engine knows nothing about the audit log today, and
+        coupling it to one so it can rate-limit would be a strange dependency
+        for a component whose job is to decide, not to remember.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO denials (agent_id, rule, denied_at) VALUES (?, ?, ?)",
+                (agent_id, rule.value, self._clock()),
+            )
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+
+    def denials_in_window(self, agent_id: str, window_secs: float) -> int:
+        """Denials that count toward the cool-down.
+
+        COOLDOWN_ACTIVE denials are excluded, and that exclusion is what makes
+        the throttle terminate. Counting them would mean every refusal renewed
+        the window, so an agent that hit the threshold once could never leave
+        it -- a permanent ban wearing a rate limit's clothes.
+        """
+        conn = self._connect()
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) AS n FROM denials WHERE agent_id = ? "
+                "AND rule != ? AND denied_at >= ?",
+                (agent_id, Rule.COOLDOWN_ACTIVE.value,
+                 self._clock() - window_secs),
+            ).fetchone()["n"]
+        finally:
+            conn.close()
+
+    def _check_cooldown(
+        self, request: PurchaseRequest, mandate: Mandate, now: float
+    ) -> Optional[Decision]:
+        if mandate.cooldown_denials <= 0:
+            return None
+        used = self.denials_in_window(request.agent_id,
+                                      mandate.cooldown_window_secs)
+        if used < mandate.cooldown_denials:
+            return None
+
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT MIN(denied_at) AS oldest FROM denials WHERE agent_id = ? "
+                "AND rule != ? AND denied_at >= ?",
+                (request.agent_id, Rule.COOLDOWN_ACTIVE.value,
+                 now - mandate.cooldown_window_secs),
+            ).fetchone()
+        finally:
+            conn.close()
+        oldest = row["oldest"] if row and row["oldest"] else now
+        retry_after = max(0.0, (oldest + mandate.cooldown_window_secs) - now)
+
+        return self._deny(
+            request,
+            Rule.COOLDOWN_ACTIVE,
+            f"agent is in cool-down: {used} denials in the last "
+            f"{mandate.cooldown_window_secs / 60:.0f} minute(s); "
+            f"retry in {retry_after:.0f}s",
+            mandate_id=mandate.mandate_id,
+            denials=used,
+            threshold=mandate.cooldown_denials,
+            window_secs=mandate.cooldown_window_secs,
+            retry_after_secs=retry_after,
+        )
+
     def _deny(
         self,
         request: PurchaseRequest,
@@ -352,6 +445,7 @@ class PolicyEngine:
         mandate_id: Optional[str] = None,
         **details,
     ) -> Decision:
+        self._record_denial(request.agent_id, rule)
         return Decision(
             approved=False,
             request=request,
