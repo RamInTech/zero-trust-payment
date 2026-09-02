@@ -20,6 +20,7 @@ from zerotrust.audit import AuditLog
 from zerotrust.catalog import demo_catalog
 from zerotrust.checkout import CheckoutService
 from zerotrust.demo import TAMPER_STATEMENTS, create_demo_app
+from zerotrust.e2e import ServerIdentity
 from zerotrust.faults import Fault, FaultInjector
 from zerotrust.gateway import PurchaseGateway
 from zerotrust.idempotency import IdempotencyStore
@@ -37,6 +38,11 @@ AGENT = "agent_alpha"
 #: `/explain/{request_id}` was added deliberately as a Section 8 stretch goal:
 #: it is a product feature, read-only, and authorises nothing. This list exists
 #: to catch additions nobody decided on -- not to freeze the API forever.
+#:
+#: `/e2e/public-key` was added deliberately too: it hands out a public key,
+#: never a secret, and reads no state -- the equivalent of a TLS certificate
+#: being public. Without it a browser has no way to encrypt a message to the
+#: server in the first place.
 PRODUCTION_ROUTES = {
     "/catalog",
     "/intents",
@@ -46,6 +52,7 @@ PRODUCTION_ROUTES = {
     "/intents/{request_id}/decline",
     "/audit/{request_id}",
     "/explain/{request_id}",
+    "/e2e/public-key",
 }
 
 
@@ -71,7 +78,8 @@ def stack(tmp_path):
 
     gateway = PurchaseGateway(engine, store, execute, audit=audit)
     checkout = CheckoutService(catalog, gateway,
-                               parser=RuleBasedIntentParser(catalog), audit=audit)
+                               parser=RuleBasedIntentParser(catalog), audit=audit,
+                               server_identity=ServerIdentity())
     app = create_demo_app(checkout, engine, audit, catalog, agent_id=AGENT,
                           faults=faults)
     return {"client": TestClient(app), "calls": calls, "catalog": catalog,
@@ -357,6 +365,7 @@ def test_security_layers_report_only_real_mechanisms(stack):
     assert ids == {
         "exactly_once", "mandate", "confirmation", "append_only_audit",
         "price_revalidation", "unknown_outcomes", "llm_no_authority",
+        "e2e_chat_encryption",
     }
     for layer in body["implemented"]:
         assert layer["mechanism"], f"{layer['id']} has no stated mechanism"
@@ -364,11 +373,11 @@ def test_security_layers_report_only_real_mechanisms(stack):
 
 
 def test_absent_protections_are_declared_absent(stack):
-    """The four layers this system does NOT have must say so, not be hidden."""
+    """The three layers this system does NOT have must say so, not be hidden."""
     body = stack["client"].get("/demo/security/layers").json()
 
     absent = {item["id"] for item in body["not_implemented"]}
-    assert absent == {"e2e_encryption", "fraud_detection", "tokenization", "mfa"}
+    assert absent == {"fraud_detection", "tokenization", "mfa"}
     for item in body["not_implemented"]:
         assert "Not implemented" in item["note"]
     # And they must never appear as though they were enforced.
