@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { AnimatePresence, motion } from "framer-motion"
-import { Bot, Check, Info, KeyRound, Send, User, X } from "lucide-react"
+import { Bot, Check, Info, KeyRound, Lock, Send, User, X } from "lucide-react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -40,6 +40,7 @@ export function Chat({ agent, config, onChanged }: {
   const [messages, setMessages] = useState<Message[]>([])
   const [text, setText] = useState("")
   const [thinking, setThinking] = useState(false)
+  const [e2e, setE2e] = useState(false)
   const nextId = useRef(1)
   const endRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -55,6 +56,7 @@ export function Chat({ agent, config, onChanged }: {
     if (messages.length === 0) {
       push({ kind: "agent", text: "What would you like to buy?" })
     }
+    api.e2ePublicKey().then(res => setE2e(res.ok))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -65,7 +67,7 @@ export function Chat({ agent, config, onChanged }: {
     setText("")
     setThinking(true)
 
-    const res = await api.intentFromText(agent, message)
+    const res = await api.intentFromTextSealed(agent, message)
 
     if (!res.ok) {
       const detail = res.body.detail ?? {}
@@ -130,7 +132,15 @@ export function Chat({ agent, config, onChanged }: {
               </p>
             </div>
           </div>
-          <Badge variant="warn">untrusted</Badge>
+          <div className="flex items-center gap-2">
+            {e2e && (
+              <Badge variant="ok">
+                <Lock className="h-3 w-3" aria-hidden="true" />
+                end-to-end encrypted
+              </Badge>
+            )}
+            <Badge variant="warn">untrusted</Badge>
+          </div>
         </CardHeader>
 
         <div

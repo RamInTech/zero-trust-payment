@@ -4,6 +4,8 @@
  * renders verdicts, it does not reach them.
  */
 
+import { seal } from "@/lib/e2e"
+
 export type Json = Record<string, any>
 
 async function call(path: string, init?: RequestInit): Promise<{ status: number; ok: boolean; body: Json }> {
@@ -65,6 +67,13 @@ export const api = {
   pending: (requestId: string) => call(`/demo/pending/${requestId}`),
 
   intentFromText: (agent_id: string, text: string) => post("/api/intents", { agent_id, text }),
+  e2ePublicKey: () => call("/api/e2e/public-key"),
+  intentFromTextSealed: async (agent_id: string, text: string) => {
+    const key = await call("/api/e2e/public-key")
+    if (!key.ok) return key
+    const sealed = seal(text, key.body.public_key_b64)
+    return post("/api/intents", { agent_id, sealed })
+  },
   intentFromSku: (agent_id: string, sku: string, quantity = 1) =>
     post("/api/purchase-intents", { agent_id, sku, quantity }),
   confirm: (requestId: string, amount_paise?: number) =>
