@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { api, type Json } from "@/api"
+import { inspectCiphertext } from "@/lib/e2e"
 import { rupees } from "@/lib/utils"
 
 /**
@@ -151,6 +152,35 @@ export function SecurityHub({ agent, layers, adversarial, onChanged }: {
       await api.compromiseParser(false)
       return { text, tone: text.startsWith("UNEXPECTED") ? "danger" : "ok", detail }
     },
+    async e2e_chat_encryption() {
+      const who = await freshAgent()
+      const message = "buy a coffee — this exact sentence should not appear in storage"
+      const res = await api.intentFromTextSealed(who, message)
+      if (!res.ok) {
+        return { text: "encryption not configured on this server", tone: "warn" }
+      }
+      const p = res.body.awaiting_confirmation as Json
+      const stored = await api.auditFor(p.request_id)
+      const entry = (stored.body.events as Json[] ?? [])
+        .find(e => e.event_type === "INTENT_PARSED")
+      const sealed = entry?.details?.raw_text_sealed
+      const plain = entry?.details?.raw_text
+      const readable = plain !== undefined
+      const ciphertext = sealed ? inspectCiphertext(sealed.ciphertext_b64) : null
+      return {
+        text: readable
+          ? "UNEXPECTED — stored in plain text"
+          : `stored as ${ciphertext?.bytes ?? "?"} bytes of ciphertext · parsed correctly as ${p.sku}`,
+        tone: readable ? "danger" : "ok",
+        detail: readable
+          ? "The words you typed were found readable in the audit log."
+          : `What's actually on disk for this message:\n\n${ciphertext?.preview}\n\n`
+            + `Your sentence never reaches storage in plain text — only the sealed `
+            + `bytes above do. The server still correctly extracted "${p.sku}" from `
+            + `it, because it held the private key needed to read the message once, `
+            + `in memory, to parse it.`,
+      }
+    },
   }
 
   const cards = (layers?.implemented ?? []) as Json[]
@@ -227,7 +257,11 @@ export function SecurityHub({ agent, layers, adversarial, onChanged }: {
                     <Button size="sm" variant="outline" disabled={busy === layer.id}
                             onClick={() => run(layer.id, runnable)}>
                       <Play className="h-3.5 w-3.5" aria-hidden="true" />
-                      {busy === layer.id ? "running…" : "Make it refuse"}
+                      {busy === layer.id
+                        ? "running…"
+                        : layer.id === "e2e_chat_encryption"
+                          ? "Check what's actually stored"
+                          : "Make it refuse"}
                     </Button>
                   )}
                   <div aria-live="polite" className="mt-2">
