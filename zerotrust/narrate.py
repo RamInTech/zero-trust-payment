@@ -20,6 +20,8 @@ from typing import Optional, Protocol, runtime_checkable
 from zerotrust.audit import AuditEntry
 
 CLAUDE_MODEL = "claude-opus-5"
+#: Overridable via GROQ_MODEL; see the note in `zerotrust/intent.py`.
+GROQ_MODEL = "qwen/qwen3.8-27b"
 
 
 @runtime_checkable
@@ -123,5 +125,51 @@ class ClaudeNarrator:
         except Exception:
             # A narrator that fails must not take an explanation down with it.
             # The deterministic sentence is always available.
+            return TemplateNarrator().narrate(entry)
+        return text or TemplateNarrator().narrate(entry)
+
+
+class GroqNarrator:
+    """The same narrator contract, via Groq's OpenAI-shaped SDK.
+
+    Holds a model id and a client and nothing else -- no store, no engine, no
+    log -- so there is no path through which it could alter the decision it is
+    describing. It receives a finalised `AuditEntry` and returns a sentence.
+    """
+
+    name = "groq"
+
+    def __init__(self, model: Optional[str] = None, client=None,
+                 api_key: Optional[str] = None) -> None:
+        self.model = model or os.environ.get("GROQ_MODEL", GROQ_MODEL)
+        if client is not None:
+            self._client = client
+        else:
+            import groq
+
+            key = api_key or os.environ.get("GROQ_API_KEY")
+            self._client = groq.Groq(api_key=key) if key else groq.Groq()
+
+    def narrate(self, entry: AuditEntry) -> str:
+        facts = {
+            "event_type": entry.event_type.value,
+            "actor": entry.actor.value,
+            "rule": entry.rule,
+            "reason": entry.reason,
+            "details": entry.details,
+        }
+        try:
+            response = self._client.chat.completions.create(
+                model=self.model,
+                max_tokens=256,
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": str(facts)},
+                ],
+            )
+            text = (response.choices[0].message.content or "").strip()
+        except Exception:
+            # A narrator that fails must not take an explanation down with it.
             return TemplateNarrator().narrate(entry)
         return text or TemplateNarrator().narrate(entry)
