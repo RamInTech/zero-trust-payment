@@ -3,9 +3,10 @@
 @tailwind utilities;
 
 /*
- * A light, flat fintech palette in the spirit of Razorpay's own product
- * surfaces: navy type, a single confident blue, generous whitespace, and
- * borders doing the work that shadows and glass were doing before.
+ * A restrained product palette in the register of Stripe's and Razorpay's own
+ * dashboards: a near-neutral ground, one accent blue that only marks what is
+ * interactive, and hairlines instead of shadows. Colour carries meaning here
+ * (approved / denied / pending) and is never decoration.
  *
  * This project is NOT Razorpay. It is built on their test-mode API for their
  * buildathon. No Razorpay logo, wordmark or domain is used here.
@@ -13,23 +14,25 @@
 
 @layer base {
   :root {
-    --background: 210 33% 98%;
-    --foreground: 222 47% 11%;
+    --background: 220 24% 97%;
+    --foreground: 222 26% 12%;
     --card: 0 0% 100%;
-    --card-foreground: 222 47% 11%;
-    --muted: 210 30% 96%;
-    --muted-foreground: 217 14% 42%;
-    --border: 214 24% 90%;
-    --input: 214 24% 88%;
-    --primary: 213 100% 60%;
+    --card-foreground: 222 26% 12%;
+    --muted: 220 20% 96%;
+    --muted-foreground: 220 9% 44%;
+    --faint: 220 8% 58%;
+    --border: 220 16% 90%;
+    --border-strong: 220 14% 84%;
+    --input: 220 16% 88%;
+    --primary: 224 76% 52%;
     --primary-foreground: 0 0% 100%;
-    --ring: 213 100% 60%;
-    --navy: 222 60% 14%;
-    --accent: 259 84% 60%;
-    --ok: 145 63% 37%;
-    --warn: 32 90% 44%;
-    --danger: 351 78% 48%;
-    --radius: 0.6rem;
+    --ring: 224 76% 52%;
+    --navy: 222 30% 15%;
+    --accent: 259 74% 56%;
+    --ok: 152 52% 32%;
+    --warn: 28 82% 41%;
+    --danger: 352 66% 46%;
+    --radius: 0.5rem;
   }
 
   * { @apply border-border; }
@@ -38,25 +41,30 @@
 
   body {
     @apply bg-background text-foreground antialiased;
-    font-feature-settings: "cv02", "cv03", "cv04", "ss01";
-    letter-spacing: -0.011em;
+    font-family: ui-sans-serif, -apple-system, "Segoe UI", Inter, system-ui, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    letter-spacing: -0.006em;
   }
 
-  h1, h2, h3 { letter-spacing: -0.021em; }
+  h1, h2, h3, h4 {
+    letter-spacing: -0.018em;
+    font-weight: 600;
+  }
 
   :focus-visible {
     @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
   }
 
-  ::selection { background: hsl(var(--primary) / 0.16); }
+  ::selection { background: hsl(var(--primary) / 0.14); }
 
-  ::-webkit-scrollbar { width: 11px; height: 11px; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb {
-    background: hsl(214 18% 82%); border-radius: 99px;
+    background: hsl(220 12% 82%); border-radius: 99px;
     border: 3px solid transparent; background-clip: content-box;
   }
-  ::-webkit-scrollbar-thumb:hover { background: hsl(214 16% 72%); background-clip: content-box; }
+  ::-webkit-scrollbar-thumb:hover { background: hsl(220 10% 70%); background-clip: content-box; }
 
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after {
@@ -67,50 +75,38 @@
 }
 
 @layer components {
-  /* A plain, honest card. No blur, no gradient scrim. */
+  /* One surface treatment, used everywhere. A border and a hairline shadow. */
   .surface {
     @apply border bg-card;
-    box-shadow: 0 1px 2px hsl(222 47% 11% / 0.04);
+    box-shadow: 0 1px 1px hsl(222 26% 12% / 0.03);
   }
 
-  .surface-hover {
-    transition: box-shadow 180ms ease, border-color 180ms ease;
-  }
-  .surface-hover:hover {
-    border-color: hsl(214 20% 84%);
-    box-shadow: 0 2px 8px hsl(222 47% 11% / 0.07);
-  }
-
-  /* Inset regions: tables, evidence blocks, code. */
-  .subtle { @apply border border-border bg-muted/60; }
+  /* Inset regions: evidence blocks, code, stored ciphertext. Never nested
+     inside another bordered box -- these replace a border, not stack on one. */
+  .subtle { @apply bg-muted/70; }
 
   .mono {
-    @apply font-mono text-[12px] leading-relaxed;
-    letter-spacing: -0.012em;
+    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    letter-spacing: -0.01em;
+    font-variant-numeric: tabular-nums;
   }
 
-  .display {
-    @apply text-[26px] font-semibold tabular-nums text-[hsl(var(--navy))];
-    letter-spacing: -0.028em;
+  /* Section label. Used for column headers and small-caps labels only --
+     not for card titles, which are sentence case at readable weight. */
+  .label {
+    @apply text-[11px] font-medium uppercase tracking-[0.06em] text-[hsl(var(--faint))];
   }
 
-  .eyebrow {
-    @apply text-[11px] font-semibold uppercase tracking-[0.075em] text-muted-foreground;
+  /* A figure: the number in a stat. Sized to sit beside body text, not to
+     dominate it. */
+  .figure {
+    @apply text-[22px] font-semibold tabular-nums text-foreground;
+    letter-spacing: -0.025em;
   }
 
-  .pulse-dot { position: relative; }
-  .pulse-dot::before {
-    content: "";
-    position: absolute;
-    inset: -4px;
-    border-radius: 999px;
-    background: currentColor;
-    opacity: 0.25;
-    animation: pulse-ring 2.4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-  }
-  @keyframes pulse-ring {
-    0%   { transform: scale(0.7); opacity: 0.3; }
-    70%  { transform: scale(1.45); opacity: 0; }
-    100% { transform: scale(1.45); opacity: 0; }
+  /* Row separators do the work that per-row borders were doing before. */
+  .divide-rows > * + * {
+    border-top: 1px solid hsl(var(--border));
   }
 }

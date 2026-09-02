@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from "react"
-import { AnimatePresence, motion } from "framer-motion"
-import { Check, CircleAlert, KeyRound, X } from "lucide-react"
+import { Check, X } from "lucide-react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
+import { Row, Rows } from "@/components/ui/rows"
 import { api, type ConfirmResult, type Json, type Pending } from "@/api"
-import { rupees } from "@/lib/utils"
+import { cn, rupees } from "@/lib/utils"
 
 type Step = "browse" | "draft" | "result"
 
@@ -14,13 +14,6 @@ const STEPS: { id: Step; label: string }[] = [
   { id: "draft", label: "Confirm" },
   { id: "result", label: "Result" },
 ]
-
-const slide = {
-  initial: { opacity: 0, x: 18 },
-  animate: { opacity: 1, x: 0 },
-  exit: { opacity: 0, x: -18 },
-  transition: { duration: 0.28, ease: [0.22, 1, 0.36, 1] as const },
-}
 
 export function Checkout({ agent, catalog, onChanged }: {
   agent: string; catalog: Json[]; onChanged: () => void
@@ -33,7 +26,7 @@ export function Checkout({ agent, catalog, onChanged }: {
   const [busy, setBusy] = useState(false)
   const headingRef = useRef<HTMLHeadingElement>(null)
 
-  // Move focus with the step, or keyboard users are stranded behind the animation.
+  // Move focus with the step, or keyboard users are stranded behind it.
   useEffect(() => { headingRef.current?.focus() }, [step])
 
   async function propose(fromSku?: string) {
@@ -73,155 +66,175 @@ export function Checkout({ agent, catalog, onChanged }: {
     setStep("result"); onChanged()
   }
 
+  const stepIndex = STEPS.findIndex(s => s.id === step)
+
   return (
-    <div className="grid gap-5 lg:grid-cols-[1fr_360px]">
+    <div className="grid gap-4 lg:grid-cols-[1fr_300px]">
       <Card>
-        <CardHeader className="flex flex-row items-center justify-between">
+        <CardHeader>
           <CardTitle>Purchase flow</CardTitle>
-          <ol className="flex items-center gap-1.5" aria-label="Progress">
-            {STEPS.map((s, i) => {
-              const active = STEPS.findIndex(x => x.id === step) >= i
-              return (
-                <li key={s.id} className="flex items-center gap-1.5">
-                  <span className={`mono rounded px-2 py-0.5 ${active ? "bg-primary/15 text-primary" : "text-muted-foreground"}`}
-                        aria-current={step === s.id ? "step" : undefined}>
-                    {i + 1}. {s.label}
-                  </span>
-                  {i < STEPS.length - 1 && <span className="text-muted-foreground" aria-hidden="true">→</span>}
-                </li>
-              )
-            })}
+          <ol className="flex items-center gap-2" aria-label="Progress">
+            {STEPS.map((s, i) => (
+              <li key={s.id} className="flex items-center gap-2">
+                <span
+                  aria-current={step === s.id ? "step" : undefined}
+                  className={cn(
+                    "text-xs",
+                    i < stepIndex && "text-muted-foreground",
+                    i === stepIndex && "font-medium text-primary",
+                    i > stepIndex && "text-faint"
+                  )}
+                >
+                  {s.label}
+                </span>
+                {i < STEPS.length - 1 && (
+                  <span className="h-px w-5 bg-border" aria-hidden="true" />
+                )}
+              </li>
+            ))}
           </ol>
         </CardHeader>
         <CardContent>
           <h3 ref={headingRef} tabIndex={-1} className="sr-only">
-            Step {STEPS.findIndex(s => s.id === step) + 1}: {STEPS.find(s => s.id === step)?.label}
+            Step {stepIndex + 1}: {STEPS[stepIndex]?.label}
           </h3>
 
-          <AnimatePresence mode="wait">
-            {step === "browse" && (
-              <motion.div key="browse" {...slide} className="grid gap-4">
-                <div>
-                  <label htmlFor="intent" className="text-[12.5px] text-muted-foreground">
-                    Describe what you want
-                  </label>
-                  <div className="mt-1.5 flex gap-2">
-                    <input id="intent" value={text} onChange={e => setText(e.target.value)}
-                      onKeyDown={e => e.key === "Enter" && propose()}
-                      className="mono flex-1 rounded-lg border border-border bg-muted/60 px-3.5 py-2.5 text-foreground transition-colors placeholder:text-muted-foreground/60 focus-visible:border-primary/40 focus-visible:ring-2 focus-visible:ring-ring" />
-                    <Button onClick={() => propose()} disabled={busy}>Send</Button>
-                  </div>
+          {step === "browse" && (
+            <div className="grid gap-5">
+              <div>
+                <label htmlFor="intent" className="label">Describe what you want</label>
+                <div className="mt-1.5 flex gap-2">
+                  <input id="intent" value={text} onChange={e => setText(e.target.value)}
+                    onKeyDown={e => e.key === "Enter" && propose()}
+                    className="h-9 flex-1 rounded-md border border-input bg-card px-3 text-sm transition-colors placeholder:text-faint focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-ring" />
+                  <Button onClick={() => propose()} disabled={busy}>Propose</Button>
                 </div>
-                <div>
-                  <div className="text-[12.5px] text-muted-foreground">Or select an item</div>
-                  <div className="mt-2 grid gap-2 sm:grid-cols-2">
-                    {catalog.map(item => (
-                      <button key={item.sku} onClick={() => propose(item.sku)} disabled={busy}
-                        className="group flex items-center justify-between rounded-xl border border-border bg-muted/50 px-3.5 py-2.5 text-left transition-all hover:-translate-y-0.5 hover:border-primary/30 hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50">
-                        <span>
-                          <span className="block text-[13.5px]">{item.name}</span>
-                          <span className="mono text-muted-foreground">{item.sku}</span>
+              </div>
+
+              <div>
+                <div className="label mb-1.5">Or select an item</div>
+                <ul className="divide-rows overflow-hidden rounded-md border border-border">
+                  {catalog.map(item => (
+                    <li key={item.sku}>
+                      <button
+                        onClick={() => propose(item.sku)} disabled={busy}
+                        className="flex w-full items-center justify-between gap-4 px-3.5 py-2.5 text-left transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring disabled:opacity-50"
+                      >
+                        <span className="min-w-0">
+                          <span className="block truncate text-sm text-foreground">{item.name}</span>
+                          <span className="mono text-faint">{item.sku}</span>
                         </span>
-                        <span className="mono tabular-nums">{rupees(item.price_paise)}</span>
+                        <span className="mono shrink-0 text-foreground">
+                          {rupees(item.price_paise)}
+                        </span>
                       </button>
-                    ))}
-                  </div>
-                </div>
-              </motion.div>
-            )}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            </div>
+          )}
 
-            {step === "draft" && pending && (
-              <motion.div key="draft" {...slide}>
-                <Badge variant="warn">
-                  <CircleAlert className="h-3 w-3" aria-hidden="true" />
-                  Proposed by the agent — not approved
-                </Badge>
-                <p className="mt-3.5 text-[19px] font-semibold tracking-[-0.015em]">{pending.prompt}</p>
-                <dl className="mono mt-3 grid grid-cols-[86px_1fr] gap-x-3 gap-y-1 text-muted-foreground">
-                  <dt>parsed by</dt><dd>{pending.parser}</dd>
-                  <dt>request</dt><dd>{pending.request_id}</dd>
-                  <dt className="flex items-center gap-1"><KeyRound className="h-3 w-3" aria-hidden="true" />key</dt>
-                  <dd className="text-foreground/80">{pending.idempotency_key ?? "—"}</dd>
-                </dl>
-                <div className="mt-4 flex gap-2">
-                  <Button onClick={confirm} disabled={busy}><Check className="h-4 w-4" aria-hidden="true" />Confirm</Button>
-                  <Button variant="outline" onClick={decline} disabled={busy}><X className="h-4 w-4" aria-hidden="true" />Decline</Button>
-                </div>
-                <p className="mt-3 text-[12.5px] text-muted-foreground">
-                  Not authorised yet.
-                </p>
-              </motion.div>
-            )}
+          {step === "draft" && pending && (
+            <div>
+              <Badge variant="warn">Proposed by the agent — not approved</Badge>
+              <p className="mt-3 text-lg font-semibold text-foreground">{pending.prompt}</p>
+              <Rows className="mt-3 border-t border-border pt-2.5">
+                <Row label="Parsed by" value={pending.parser} />
+                <Row label="Request" value={pending.request_id} />
+                <Row label="Idempotency key" value={pending.idempotency_key ?? "—"} />
+              </Rows>
+              <div className="mt-4 flex gap-2">
+                <Button onClick={confirm} disabled={busy}>
+                  <Check className="h-4 w-4" aria-hidden="true" />Confirm
+                </Button>
+                <Button variant="outline" onClick={decline} disabled={busy}>
+                  <X className="h-4 w-4" aria-hidden="true" />Decline
+                </Button>
+              </div>
+              <p className="mt-3 text-xs text-muted-foreground">Not authorised yet.</p>
+            </div>
+          )}
 
-            {step === "result" && (
-              <motion.div key="result" {...slide}>
-                <div aria-live="polite">
-                  {error ? (
-                    <>
-                      <Badge variant={error.code === "PENDING_VERIFICATION" ? "warn" : "danger"}>{error.code}</Badge>
-                      <p className="mono mt-3 text-foreground/90">{error.reason}</p>
-                      {(error as Json).guidance && (
-                        <p className="mt-2 text-[12.5px] italic text-muted-foreground">{(error as Json).guidance}</p>
-                      )}
-                    </>
-                  ) : result?.approved ? (
-                    <>
-                      <Badge variant="ok">Approved — {result.idempotency_outcome}</Badge>
-                      <ul className="mono mt-3 grid gap-1">
-                        <li><span className="text-ok">✓</span> amount within the per-transaction cap</li>
-                        <li><span className="text-ok">✓</span> item on the mandate allowlist</li>
-                        <li><span className="text-ok">✓</span> mandate not expired</li>
-                        <li><span className="text-ok">✓</span> velocity slot claimed</li>
-                      </ul>
-                      <dl className="mono mt-3 grid grid-cols-[110px_1fr] gap-x-3 gap-y-1 text-muted-foreground">
-                        <dt>confirmed by</dt><dd className="text-primary">HUMAN ✓</dd>
-                        <dt>decided by</dt><dd className="text-ok">POLICY_ENGINE</dd>
-                        <dt>order</dt><dd>{result.response?.order_id ?? "—"}</dd>
-                        <dt>money moved</dt><dd>{result.executed ? "yes, once" : "no — replayed"}</dd>
-                      </dl>
-                      <p className="mt-3 text-[12px] text-warn">Capture simulated.</p>
-                    </>
-                  ) : result ? (
-                    <>
-                      <Badge variant="danger">Denied — {result.rule}</Badge>
-                      <p className="mono mt-3 text-foreground/90">{result.reason}</p>
-                      <dl className="mono mt-3 grid grid-cols-[110px_1fr] gap-x-3 gap-y-1 text-muted-foreground">
-                        <dt>confirmed by</dt><dd className="text-primary">HUMAN ✓</dd>
-                        <dt>decided by</dt><dd className="text-ok">POLICY_ENGINE</dd>
-                        <dt>money moved</dt><dd>none</dd>
-                      </dl>
-
-                    </>
-                  ) : null}
-                </div>
-                <div className="mt-4 flex gap-2">
-                  {pending && result && (
-                    <Button variant="outline" onClick={confirm} disabled={busy}>Confirm again</Button>
-                  )}
-                  <Button variant="ghost" onClick={() => { setStep("browse"); setPending(null); setResult(null); setError(null) }}>
-                    Start another
-                  </Button>
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
+          {step === "result" && (
+            <div>
+              <div aria-live="polite">
+                {error ? (
+                  <>
+                    <Badge variant={error.code === "PENDING_VERIFICATION" ? "warn" : "danger"}>
+                      {error.code}
+                    </Badge>
+                    <p className="mt-2.5 text-sm text-foreground">{error.reason}</p>
+                    {(error as Json).guidance && (
+                      <p className="mt-1.5 text-xs text-muted-foreground">
+                        {(error as Json).guidance}
+                      </p>
+                    )}
+                  </>
+                ) : result?.approved ? (
+                  <>
+                    <Badge variant="ok" dot>Approved — {result.idempotency_outcome}</Badge>
+                    <ul className="mt-3 grid gap-1.5">
+                      {[
+                        "Amount within the per-transaction cap",
+                        "Item on the mandate allowlist",
+                        "Mandate not expired",
+                        "Velocity slot claimed",
+                      ].map(check => (
+                        <li key={check} className="flex items-center gap-2 text-xs text-muted-foreground">
+                          <Check className="h-3.5 w-3.5 shrink-0 text-ok" aria-hidden="true" />
+                          {check}
+                        </li>
+                      ))}
+                    </ul>
+                    <Rows className="mt-3 border-t border-border pt-2.5">
+                      <Row label="Confirmed by" value="HUMAN" />
+                      <Row label="Decided by" value="POLICY_ENGINE" tone="ok" />
+                      <Row label="Order" value={result.response?.order_id ?? "—"} />
+                      <Row label="Money moved"
+                           value={result.executed ? "Yes, once" : "No — replayed"} />
+                    </Rows>
+                    <p className="mt-3 text-xs text-warn">Capture is simulated.</p>
+                  </>
+                ) : result ? (
+                  <>
+                    <Badge variant="danger">Denied — {result.rule}</Badge>
+                    <p className="mt-2.5 text-sm text-foreground">{result.reason}</p>
+                    <Rows className="mt-3 border-t border-border pt-2.5">
+                      <Row label="Confirmed by" value="HUMAN" />
+                      <Row label="Decided by" value="POLICY_ENGINE" tone="ok" />
+                      <Row label="Money moved" value="None" />
+                    </Rows>
+                  </>
+                ) : null}
+              </div>
+              <div className="mt-4 flex gap-2">
+                {pending && result && (
+                  <Button variant="outline" onClick={confirm} disabled={busy}>Confirm again</Button>
+                )}
+                <Button variant="ghost"
+                        onClick={() => { setStep("browse"); setPending(null); setResult(null); setError(null) }}>
+                  Start another
+                </Button>
+              </div>
+            </div>
+          )}
         </CardContent>
       </Card>
 
       <Card className="h-fit">
         <CardHeader><CardTitle>What happens on confirm</CardTitle></CardHeader>
         <CardContent>
-          <ol className="grid gap-3 text-[12.5px]">
+          <ol className="divide-rows">
             {[
-              ["Price re-read", "compared against what you were shown"],
-              ["Mandate re-checked", "against the mandate in force now"],
-              ["Key claimed", "unique-constraint INSERT"],
-              ["Recorded, then executed", "audit entry written first"],
-            ].map(([title, body], i) => (
-              <li key={title} className="grid grid-cols-[22px_1fr] gap-2.5">
-                <span className="mono grid h-5 w-5 place-items-center rounded border border-border bg-muted/50 text-[10px] text-muted-foreground">{i + 1}</span>
-                <span><strong className="font-semibold">{title}.</strong>{" "}
-                  <span className="text-muted-foreground">{body}</span></span>
+              ["Price re-read", "Compared against what you were shown"],
+              ["Mandate re-checked", "Against the mandate in force now"],
+              ["Key claimed", "Unique-constraint INSERT"],
+              ["Recorded, then executed", "Audit entry written first"],
+            ].map(([title, body]) => (
+              <li key={title} className="py-2 first:pt-0 last:pb-0">
+                <p className="text-xs font-medium text-foreground">{title}</p>
+                <p className="text-xs text-muted-foreground">{body}</p>
               </li>
             ))}
           </ol>

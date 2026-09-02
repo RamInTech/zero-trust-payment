@@ -14,7 +14,7 @@ const TONE: Record<string, string> = {
 
 export function ActorTag({ actor, className }: { actor: string; className?: string }) {
   return (
-    <span className={cn("mono text-[10.5px] font-semibold tracking-wide", TONE[actor] ?? "text-muted-foreground", className)}>
+    <span className={cn("mono truncate", TONE[actor] ?? "text-muted-foreground", className)}>
       {actor}
     </span>
   )

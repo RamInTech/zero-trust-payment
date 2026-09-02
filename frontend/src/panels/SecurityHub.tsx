@@ -1,13 +1,12 @@
 import { useState } from "react"
-import { AnimatePresence, motion } from "framer-motion"
-import { Ban, Lock, Play, ShieldCheck, TriangleAlert } from "lucide-react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
+import { Row, Rows } from "@/components/ui/rows"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { api, type Json } from "@/api"
 import { inspectCiphertext } from "@/lib/e2e"
-import { rupees } from "@/lib/utils"
+import { cn, rupees } from "@/lib/utils"
 
 /**
  * Every panel here is backed by a mechanism that exists. The four layers a
@@ -65,7 +64,10 @@ export function SecurityHub({ agent, layers, adversarial, onChanged }: {
       }
     },
     async mandate() {
-      const p = await draft("SKU-MUG", await freshAgent())
+      // SKU-BEANS (Rs.900) is a real, in-stock, fully purchasable item that
+      // sits above the Rs.500 cap -- so the refusal is on the merits, not
+      // because the item was excluded from a list in advance.
+      const p = await draft("SKU-BEANS", await freshAgent())
       if (!p) return { text: "rejected at the catalog", tone: "ok" }
       const r = await api.confirm(p.request_id)
       return {
@@ -184,167 +186,149 @@ export function SecurityHub({ agent, layers, adversarial, onChanged }: {
   }
 
   const cards = (layers?.implemented ?? []) as Json[]
+  const totals = adversarial?.totals
 
   return (
-    <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}
-                transition={{ duration: 0.32 }} className="grid gap-5">
-      <Card interactive={false} className="overflow-hidden">
-        <div className="h-[2px] w-full bg-gradient-to-r from-ok/70 via-primary/60 to-accent/50" aria-hidden="true" />
-        <CardContent className="flex items-start gap-3.5 pt-5">
-          <span className="grid h-9 w-9 shrink-0 place-items-center rounded-md border border-ok/25 bg-ok/[0.08]" aria-hidden="true">
-            <ShieldCheck className="h-[18px] w-[18px] text-ok" />
-          </span>
-          <div>
-            <p className="text-[13px] leading-relaxed">
-              Each protection below is implemented and can be made to refuse
-              something now.
-            </p>
-          </div>
-        </CardContent>
-      </Card>
+    <div className="grid gap-4">
+      <p className="rounded-lg border border-border bg-card px-4 py-2.5 text-xs text-muted-foreground">
+        <span className="font-medium text-foreground">Each protection below is implemented.</span>{" "}
+        Every one can be made to refuse something now.
+      </p>
 
-      <div className="columns-1 gap-5 md:columns-2 [&>*]:mb-5 [&>*]:break-inside-avoid">
-        {cards.map((layer, index) => {
+      <div className="grid gap-4 md:grid-cols-2">
+        {cards.map(layer => {
           const outcome = outcomes[layer.id]
           const runnable = proofs[layer.id]
           return (
-            <motion.div
-              key={layer.id}
-              initial={{ opacity: 0, y: 16 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.42, delay: index * 0.05, ease: [0.22, 1, 0.36, 1] }}
-              className="break-inside-avoid"
-            >
-            <Card className="flex h-full flex-col overflow-hidden">
-
-              <CardHeader className="flex flex-row items-start justify-between gap-3">
-                <div className="flex items-center gap-2.5">
-                  <span className="mono grid h-6 w-6 place-items-center rounded-md border border-border bg-muted/50 text-[10.5px] text-muted-foreground" aria-hidden="true">
-                    {index + 1}
-                  </span>
-                  <CardTitle className="normal-case tracking-[-0.01em] text-[14px] font-semibold text-foreground">
-                    {layer.title}
-                  </CardTitle>
-                </div>
-                <Badge variant="ok"><Lock className="h-3 w-3" aria-hidden="true" />enforced</Badge>
+            <Card key={layer.id} className="flex flex-col">
+              <CardHeader>
+                <CardTitle>{layer.title}</CardTitle>
+                <Badge variant="ok" dot>Enforced</Badge>
               </CardHeader>
-              <CardContent className="flex flex-1 flex-col gap-3">
-                <p className="text-[12.5px] leading-relaxed text-muted-foreground">
+              <CardContent className="flex flex-1 flex-col gap-3.5">
+                <p className="text-xs leading-relaxed text-muted-foreground">
                   {layer.mechanism}
                 </p>
 
-                <dl className="mono grid grid-cols-2 gap-x-3 gap-y-1.5 rounded-md subtle px-3.5 py-2.5">
-                  {Object.entries(layer.evidence as Json)
-                    .slice(0, 4)
-                    .map(([k, v]) => (
-                      <div key={k} className="col-span-2 flex items-baseline justify-between gap-3">
-                        <dt className="text-muted-foreground">{k.replace(/_/g, " ")}</dt>
-                        <dd className="tabular-nums">
-                          {Array.isArray(v)
-                            ? v.length
-                            : typeof v === "boolean"
-                              ? (v ? "yes" : "no")
-                              : v !== null && typeof v === "object"
-                                ? Object.keys(v).length
-                                : String(v)}
-                        </dd>
-                      </div>
-                    ))}
-                </dl>
+                {/* What the mechanism does NOT cover, shown beside what it
+                    does. A caveat that lives only in the API response is a
+                    caveat nobody reads. */}
+                {layer.boundary && (
+                  <p className="border-l-2 border-warn/40 pl-2.5 text-2xs leading-relaxed text-faint">
+                    <span className="font-medium text-muted-foreground">Limits: </span>
+                    {layer.boundary}
+                  </p>
+                )}
+
+                <Rows className="border-t border-border pt-2.5">
+                  {Object.entries(layer.evidence as Json).slice(0, 4).map(([k, v]) => (
+                    <Row
+                      key={k}
+                      label={k.replace(/_/g, " ")}
+                      value={
+                        Array.isArray(v) ? v.length
+                          : typeof v === "boolean" ? (v ? "yes" : "no")
+                          : v !== null && typeof v === "object" ? Object.keys(v).length
+                          : String(v)
+                      }
+                    />
+                  ))}
+                </Rows>
 
                 <div className="mt-auto">
                   {runnable && (
                     <Button size="sm" variant="outline" disabled={busy === layer.id}
                             onClick={() => run(layer.id, runnable)}>
-                      <Play className="h-3.5 w-3.5" aria-hidden="true" />
                       {busy === layer.id
-                        ? "running…"
+                        ? "Running…"
                         : layer.id === "e2e_chat_encryption"
                           ? "Check what's actually stored"
                           : "Make it refuse"}
                     </Button>
                   )}
-                  <div aria-live="polite" className="mt-2">
-                    <AnimatePresence>
-                      {outcome && (
-                        <motion.div initial={{ opacity: 0, y: -4 }} animate={{ opacity: 1, y: 0 }}
-                                    exit={{ opacity: 0 }} transition={{ duration: 0.2 }}>
-                          <p className={`mono ${outcome.tone === "ok" ? "text-ok" : outcome.tone === "warn" ? "text-warn" : "text-danger"}`}>
-                            {outcome.text}
-                          </p>
-                          {outcome.detail && (
-                            <p className="mono mt-1 max-h-56 overflow-auto whitespace-pre-wrap rounded subtle p-2.5 text-[11.5px] text-muted-foreground">
-                              {outcome.detail}
-                            </p>
-                          )}
-                        </motion.div>
-                      )}
-                    </AnimatePresence>
+                  <div aria-live="polite">
+                    {outcome && (
+                      <div className="mt-2.5">
+                        <p className={cn("mono",
+                          outcome.tone === "ok" ? "text-ok"
+                            : outcome.tone === "warn" ? "text-warn" : "text-danger")}>
+                          {outcome.text}
+                        </p>
+                        {outcome.detail && (
+                          <pre className="mono subtle mt-1.5 max-h-56 overflow-auto whitespace-pre-wrap rounded-md p-3 text-muted-foreground">
+                            {outcome.detail}
+                          </pre>
+                        )}
+                      </div>
+                    )}
                   </div>
                 </div>
               </CardContent>
             </Card>
-            </motion.div>
           )
         })}
       </div>
 
       {adversarial && (
-        <Card interactive={false} className="overflow-hidden">
-
-          <CardHeader className="flex flex-row items-baseline justify-between">
-            <CardTitle>Adversarial suite</CardTitle>
-            <Badge variant={adversarial.totals.breached === 0 ? "ok" : "danger"}>
-              {adversarial.totals.defended} of {adversarial.totals.attacks} defended ·
-              {" "}{adversarial.totals.unintended_charges} unintended charges
-            </Badge>
+        <Card>
+          <CardHeader>
+            <div>
+              <CardTitle>Adversarial suite</CardTitle>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                Generated by <span className="mono">scripts/run_adversarial_suite.py</span>
+              </p>
+            </div>
+            <div className="shrink-0 text-right">
+              <div className="text-sm font-semibold tabular-nums text-foreground">
+                {totals.defended} / {totals.attacks} defended
+              </div>
+              <div className="text-xs text-muted-foreground">
+                {totals.unintended_charges} unintended charges
+              </div>
+            </div>
           </CardHeader>
-          <CardContent>
-            <p className="mb-3 text-[12px] text-muted-foreground">
-              Generated by <span className="mono">scripts/run_adversarial_suite.py</span>.
-            </p>
-            <ul className="grid gap-1">
-              {(adversarial.attacks as Json[]).map((a, i) => (
-                <li key={a.name} className="grid grid-cols-[24px_1fr_auto] items-center gap-2 rounded-md px-1.5 py-1 transition-colors hover:bg-muted/50">
-                  <span className="mono text-muted-foreground/70">{String(i + 1).padStart(2, "0")}</span>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <span className="cursor-help truncate text-[12.5px]">{a.attack}</span>
-                    </TooltipTrigger>
-                    <TooltipContent>{a.defence}</TooltipContent>
-                  </Tooltip>
-                  <Badge variant={a.status === "DEFENDED" ? "ok" : "danger"}>{a.status}</Badge>
-                </li>
-              ))}
-            </ul>
-          </CardContent>
+          <ul className="divide-rows">
+            {(adversarial.attacks as Json[]).map((a, i) => (
+              <li key={a.name}
+                  className="grid grid-cols-[28px_1fr_auto] items-center gap-3 px-5 py-2">
+                <span className="mono text-faint">{String(i + 1).padStart(2, "0")}</span>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span className="cursor-help truncate text-xs text-foreground">{a.attack}</span>
+                  </TooltipTrigger>
+                  <TooltipContent>{a.defence}</TooltipContent>
+                </Tooltip>
+                <span className={cn("flex items-center gap-1.5 text-xs",
+                  a.status === "DEFENDED" ? "text-ok" : "text-danger")}>
+                  <span className="h-1.5 w-1.5 rounded-full bg-current" aria-hidden="true" />
+                  {a.status.toLowerCase()}
+                </span>
+              </li>
+            ))}
+          </ul>
         </Card>
       )}
 
-      <Card interactive={false} className="border-dashed">
-        <CardHeader className="flex flex-row items-center gap-2">
-          <TriangleAlert className="h-4 w-4 text-warn" aria-hidden="true" />
-          <CardTitle className="normal-case tracking-normal text-[13.5px] text-foreground">
-            Not implemented — stated rather than implied
-          </CardTitle>
+      <Card>
+        <CardHeader>
+          <div>
+            <CardTitle>Not implemented — stated rather than implied</CardTitle>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              Commonly expected, and absent here.
+            </p>
+          </div>
         </CardHeader>
         <CardContent>
-          <p className="mb-3 text-[12px] text-muted-foreground">
-            Commonly expected, and absent here.
-          </p>
-          <ul className="grid gap-2 md:grid-cols-2">
+          <ul className="grid gap-3 sm:grid-cols-3">
             {((layers?.not_implemented ?? []) as Json[]).map(item => (
-              <li key={item.id} className="rounded-md border border-dashed border-border bg-muted/40 px-3.5 py-2.5">
-                <div className="flex items-center gap-2">
-                  <Ban className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
-                  <span className="text-[13px] font-medium text-muted-foreground">{item.title}</span>
-                </div>
-                <p className="mt-1 text-[12px] text-muted-foreground/80">{item.note}</p>
+              <li key={item.id}>
+                <p className="text-xs font-medium text-muted-foreground">{item.title}</p>
+                <p className="mt-0.5 text-xs text-faint">{item.note}</p>
               </li>
             ))}
           </ul>
         </CardContent>
       </Card>
-    </motion.div>
+    </div>
   )
 }

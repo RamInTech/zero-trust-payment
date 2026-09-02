@@ -44,10 +44,15 @@ export interface ConfirmResult {
   response: Json | null
 }
 
+export interface BasketLine extends Pending {}
+
 export interface DemoConfig {
   agent_id: string
   parser: string
   llm_configured: boolean
+  llm_providers: string[]
+  /** "razorpay-test" | "simulated" | "unknown" — what the backend really does. */
+  payments_mode: string
   conversational: boolean
 }
 
@@ -81,6 +86,10 @@ export const api = {
   decline: (requestId: string) => post(`/api/intents/${requestId}/decline`),
 
   freshAgent: () => post("/demo/agent"),
+  setCap: (agent: string, max_amount_paise: number) =>
+    post(`/demo/mandate/${agent}/cap`, { max_amount_paise }),
+  addItem: (sku: string, name: string, price_paise: number) =>
+    post("/demo/catalog", { sku, name, price_paise }),
   setPrice: (sku: string, price_paise: number) =>
     post(`/demo/catalog/${sku}/price`, { price_paise }),
   tamper: () => post("/demo/tamper-audit"),
