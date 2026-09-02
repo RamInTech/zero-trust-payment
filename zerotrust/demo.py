@@ -434,13 +434,23 @@ def create_demo_app(
     def security_layers():
         """Live evidence for each protection that actually exists.
 
-        Nothing here is aspirational. Four layers a reader might expect --
-        end-to-end encryption, fraud detection, tokenization, and multi-factor
-        authentication -- are NOT implemented in this system, and are reported
-        as such rather than being rendered as though they were.
+        Nothing here is aspirational. Three layers a reader might expect --
+        fraud detection, tokenization, and multi-factor authentication -- are
+        NOT implemented in this system, and are reported as such rather than
+        being rendered as though they were.
         """
         triggers = _audit_triggers(audit.db_path)
         parsed_fields = sorted(ParsedIntent.__dataclass_fields__)
+        sealed_messages = sum(
+            1 for e in audit.all()
+            if e.event_type == EventType.INTENT_PARSED
+            and "raw_text_sealed" in e.details
+        )
+        plaintext_messages = sum(
+            1 for e in audit.all()
+            if e.event_type == EventType.INTENT_PARSED
+            and "raw_text" in e.details
+        )
         return {
             "implemented": [
                 {
@@ -521,10 +531,22 @@ def create_demo_app(
                         "intents_parsed": audit.count_of(EventType.INTENT_PARSED),
                     },
                 },
+                {
+                    "id": "e2e_chat_encryption",
+                    "title": "End-to-end encrypted chat",
+                    "mechanism": "NaCl Box (X25519 + XSalsa20-Poly1305): browser encrypts to the server's public key; only ciphertext is ever stored",
+                    "evidence": {
+                        "e2e_configured": checkout.server_identity is not None,
+                        "sealed_messages_stored": sealed_messages,
+                        "plaintext_messages_stored": plaintext_messages,
+                        "server_public_key_prefix": (
+                            checkout.server_identity.public_key_b64[:12] + "…"
+                            if checkout.server_identity else None
+                        ),
+                    },
+                },
             ],
             "not_implemented": [
-                {"id": "e2e_encryption", "title": "End-to-end encryption",
-                 "note": "Not implemented. HTTPS is transport security, not E2E."},
                 {"id": "fraud_detection", "title": "Fraud detection",
                  "note": "Not implemented. No scoring or anomaly detection."},
                 {"id": "tokenization", "title": "Tokenization",
