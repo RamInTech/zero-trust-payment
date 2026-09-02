@@ -34,10 +34,10 @@ from pydantic import BaseModel
 
 from zerotrust.api import create_app
 from zerotrust.audit import AuditLog, EventType
-from zerotrust.catalog import Catalog, ItemNotInCatalog
+from zerotrust.catalog import Catalog, CatalogItem, ItemNotInCatalog
 from zerotrust.checkout import CheckoutService
 from zerotrust.faults import Fault, FaultInjector
-from zerotrust.mandate import Mandate
+from zerotrust.mandate import ANY_SKU, Mandate
 from zerotrust.intent import ParsedIntent
 from zerotrust.policy import PolicyEngine
 
@@ -73,6 +73,16 @@ class PriceChange(BaseModel):
     price_paise: int
 
 
+class CapChange(BaseModel):
+    max_amount_paise: int
+
+
+class NewItem(BaseModel):
+    sku: str
+    name: str
+    price_paise: int
+
+
 def _audit_triggers(db_path: str) -> list[str]:
     """The append-only triggers, read straight from the schema.
 
@@ -90,6 +100,28 @@ def _audit_triggers(db_path: str) -> list[str]:
     return [r[0] for r in rows if r[0]]
 
 
+#: The lifecycle a purchase walks, in order, each stage named by the audit
+#: event that marks it reached. The UI renders this as a progress track, so it
+#: is defined here from real event types rather than invented on the client --
+#: a tracker showing stages the log cannot substantiate would be decoration.
+LIFECYCLE = [
+    ("proposed", "Proposed", EventType.PURCHASE_REQUESTED),
+    ("confirmed", "Confirmed", EventType.USER_CONFIRMED),
+    ("authorised", "Authorised", EventType.POLICY_APPROVED),
+    ("executing", "Executing", EventType.PAYMENT_ATTEMPTED),
+    ("settled", "Settled", EventType.PAYMENT_CAPTURED),
+]
+
+#: Stages that END a purchase early. Reaching one means the track stops there
+#: rather than continuing -- a denied request is finished, not stalled.
+TERMINAL_STAGES = {
+    EventType.POLICY_DENIED: ("denied", "Denied"),
+    EventType.USER_DECLINED: ("declined", "Declined"),
+    EventType.PAYMENT_FAILED: ("failed", "Failed"),
+    EventType.PAYMENT_PENDING_VERIFICATION: ("unknown", "Outcome unknown"),
+}
+
+
 #: Terminal outcomes for a transaction, most specific first. A request's status
 #: is the first of these that appears in its audit trail.
 _STATUS_ORDER = [
@@ -103,6 +135,29 @@ _STATUS_ORDER = [
 ]
 
 
+def _lifecycle_of(types: set) -> dict:
+    """Where this request has got to, and how it ended if it did.
+
+    `reached` lists the stages the audit log can actually evidence. `halted_at`
+    is set when the request ended before the end of the track, so the UI can
+    stop the progress bar rather than implying a settlement that never came.
+    """
+    reached = [key for key, _label, event in LIFECYCLE if event in types]
+    halted = next(
+        ((k, label) for event, (k, label) in TERMINAL_STAGES.items()
+         if event in types), None)
+    return {
+        "reached": reached,
+        "stage": (halted[0] if halted
+                  else (reached[-1] if reached else "proposed")),
+        "stage_label": (halted[1] if halted
+                        else next((label for key, label, _e in LIFECYCLE
+                                   if key == (reached[-1] if reached else "")),
+                                  "Proposed")),
+        "halted_at": halted[0] if halted else None,
+    }
+
+
 def create_demo_app(
     checkout: CheckoutService,
     engine: PolicyEngine,
@@ -112,6 +167,7 @@ def create_demo_app(
     faults: Optional[FaultInjector] = None,
     scheduler=None,
     narrator=None,
+    payments_mode: str = "unknown",
 ) -> FastAPI:
     demo = FastAPI(
         title="Zero-Trust Payment Authorization — reference client",
@@ -145,10 +201,28 @@ def create_demo_app(
         """
         import os
 
+        # Whichever provider is actually configured -- reporting only the one
+        # this build no longer uses would be a quietly wrong green light.
+        providers = [name for name, var in (("groq", "GROQ_API_KEY"),
+                                            ("anthropic", "ANTHROPIC_API_KEY"))
+                     if os.environ.get(var)]
         return {
             "agent_id": agent_id,
             "parser": getattr(checkout.parser, "name", "none"),
-            "llm_configured": bool(os.environ.get("ANTHROPIC_API_KEY")),
+            "llm_configured": bool(providers),
+            "llm_providers": providers,
+            # Named separately from `parser` so the UI can say "backed up by"
+            # rather than implying a fallback already happened.
+            "parser_fallback": getattr(checkout.parser, "fallback_name", None),
+            # Whether orders actually reach Razorpay. The UI used to state
+            # "Test mode" statically, which stayed reassuringly true-looking
+            # even when nothing was leaving the process at all -- the two
+            # cases are indistinguishable on screen, so the badge has to be
+            # told which one it is rather than assuming.
+            "payments_mode": payments_mode,
+            # Still false with an LLM in place: the intent layer performs
+            # structured extraction, not conversation. The model does not
+            # write the replies the user sees.
             "conversational": False,
         }
 
@@ -166,6 +240,9 @@ def create_demo_app(
             "agent_id": active.agent_id,
             "max_amount_paise": active.max_amount_paise,
             "allowed_skus": sorted(active.allowed_skus),
+            # So the UI can say "any catalog item" instead of rendering a
+            # literal "*", which looks like a bug rather than a policy.
+            "allows_any_sku": ANY_SKU in active.allowed_skus,
             "currency": active.currency,
             "expires_at": active.expires_at,
             "seconds_until_expiry": max(0.0, active.expires_at - now),
@@ -231,6 +308,84 @@ def create_demo_app(
             raise HTTPException(status_code=404, detail={"reason": str(exc)})
         catalog.set_price(sku, body.price_paise)
         return {"sku": sku, "was_paise": before, "now_paise": body.price_paise}
+
+    @demo.post("/demo/mandate/{agent}/cap")
+    def set_cap(agent: str, body: CapChange):
+        """Let the merchant move the per-transaction limit.
+
+        Issuing a mandate is a MERCHANT action, which is why this is allowed at
+        all: the mandate is the merchant's statement of how much they are
+        willing to let an agent spend. The agent cannot reach this route, and
+        nothing about it lets an agent raise its own ceiling -- that would
+        invert the entire authorisation model.
+
+        Mandates are immutable, so this revokes the old one and issues a
+        replacement rather than editing in place. The old mandate stays in the
+        store, revoked, so the history of what was permitted when survives.
+        """
+        if body.max_amount_paise <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail={"reason": "the cap must be a positive number of paise"})
+
+        current = engine.mandates.active_for_agent(agent)
+        if current is None:
+            raise HTTPException(status_code=404,
+                                detail={"reason": f"no mandate for '{agent}'"})
+
+        engine.mandates.revoke(current.mandate_id)
+        engine.mandates.issue(Mandate(
+            agent_id=agent,
+            max_amount_paise=body.max_amount_paise,
+            allowed_skus=current.allowed_skus,
+            currency=current.currency,
+            expires_at=current.expires_at,
+            velocity_limit=current.velocity_limit,
+            velocity_window_secs=current.velocity_window_secs,
+            cooldown_denials=current.cooldown_denials,
+            cooldown_window_secs=current.cooldown_window_secs,
+            created_at=engine._clock(),
+        ))
+        return {"agent_id": agent,
+                "was_paise": current.max_amount_paise,
+                "now_paise": body.max_amount_paise}
+
+    @demo.post("/demo/catalog")
+    def add_item(body: NewItem):
+        """Stock a new product, so an agent can be asked for anything.
+
+        Also a merchant action, and the reason it is safe: the PRICE is set
+        here, by the merchant, and stored in the catalog. Neither the customer
+        nor the model supplies it. That keeps the invariant that makes
+        confirm-time re-validation meaningful -- prices come from the catalog,
+        never from the request (see `_SYSTEM_PROMPT` in zerotrust/intent.py).
+
+        A mandate carrying ANY_SKU covers new items automatically; a mandate
+        with an explicit list does not, which is the correct behaviour -- an
+        item nobody authorised should not become spendable by appearing.
+        """
+        sku = body.sku.strip().upper()
+        if not sku or not body.name.strip():
+            raise HTTPException(status_code=400,
+                                detail={"reason": "sku and name are required"})
+        if body.price_paise <= 0:
+            raise HTTPException(status_code=400,
+                                detail={"reason": "price must be positive"})
+        if catalog.has(sku):
+            raise HTTPException(status_code=409,
+                                detail={"reason": f"{sku} is already stocked"})
+
+        catalog.add(CatalogItem(sku=sku, name=body.name.strip(),
+                                price_paise=body.price_paise))
+        mandate = engine.mandates.active_for_agent(agent_id)
+        return {
+            "sku": sku,
+            "name": body.name.strip(),
+            "price_paise": body.price_paise,
+            # Said plainly, because "I stocked it but the agent still cannot
+            # buy it" is otherwise a confusing five minutes.
+            "purchasable_by_agent": bool(mandate and mandate.allows_sku(sku)),
+        }
 
     @demo.post("/demo/tamper-audit")
     def tamper_audit():
@@ -426,6 +581,7 @@ def create_demo_app(
                 "rule": verdict.rule if verdict else None,
                 "reason": verdict.reason if verdict else None,
                 "event_count": len(entries),
+                **_lifecycle_of(types),
             })
         rows.sort(key=lambda r: r["updated_at"], reverse=True)
         return {"count": len(rows), "transactions": rows[:limit]}
@@ -441,6 +597,12 @@ def create_demo_app(
         """
         triggers = _audit_triggers(audit.db_path)
         parsed_fields = sorted(ParsedIntent.__dataclass_fields__)
+        # Named from the parser actually in use, not from an env var: an
+        # unused key must not make the page claim data goes somewhere it does
+        # not, and a configured parser must not be able to hide that it does.
+        parser_name = getattr(checkout.parser, "name", "") or ""
+        llm_provider = next(
+            (p for p in ("groq", "claude") if p in parser_name.lower()), None)
         sealed_messages = sum(
             1 for e in audit.all()
             if e.event_type == EventType.INTENT_PARSED
@@ -535,10 +697,24 @@ def create_demo_app(
                     "id": "e2e_chat_encryption",
                     "title": "End-to-end encrypted chat",
                     "mechanism": "NaCl Box (X25519 + XSalsa20-Poly1305): browser encrypts to the server's public key; only ciphertext is ever stored",
+                    # The boundary, stated rather than implied. Parsing needs
+                    # the plaintext, so with an LLM parser configured the
+                    # decrypted text is also sent to that provider. Storage is
+                    # what this protects; it is not protection from everyone.
+                    "boundary": (
+                        "Protects data at rest: a database backup, replica or "
+                        "leaked file contains no readable message. It does not "
+                        "hide the message from the running server, which must "
+                        "decrypt it to parse it"
+                        + (f", nor from the {llm_provider} API it is sent to for "
+                           f"parsing" if llm_provider else "")
+                        + "."
+                    ),
                     "evidence": {
                         "e2e_configured": checkout.server_identity is not None,
                         "sealed_messages_stored": sealed_messages,
                         "plaintext_messages_stored": plaintext_messages,
+                        "decrypted_text_sent_to": llm_provider or "nothing external",
                         "server_public_key_prefix": (
                             checkout.server_identity.public_key_b64[:12] + "…"
                             if checkout.server_identity else None
