@@ -50,6 +50,12 @@ CREATE INDEX IF NOT EXISTS idx_mandates_agent ON mandates(agent_id);
 """
 
 
+#: Wildcard entry for `allowed_skus`: every catalog item is purchasable and
+#: the per-transaction cap is the only boundary on *what* may be bought.
+#: Chosen as a sentinel no real SKU can collide with.
+ANY_SKU = "*"
+
+
 @dataclass(frozen=True)
 class Mandate:
     agent_id: str
@@ -76,7 +82,15 @@ class Mandate:
         return self.revoked_at is not None
 
     def allows_sku(self, sku: str) -> bool:
-        return sku in self.allowed_skus
+        """`ANY_SKU` means the item list is not the constraint; the cap is.
+
+        Still an allowlist, not a denylist: the wildcard has to be written
+        deliberately by whoever issues the mandate. It cannot be arrived at by
+        forgetting to populate the set -- an empty `allowed_skus` allows
+        nothing, which is the failing-closed behaviour this rule exists for.
+        A merchant who wants a bounded item list still gets one.
+        """
+        return ANY_SKU in self.allowed_skus or sku in self.allowed_skus
 
 
 class MandateStore:
