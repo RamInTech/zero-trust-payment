@@ -1,19 +1,27 @@
 """Serve the reference client.
 
-    uv run python scripts/run_ui.py          # stubbed executor, no credentials
-    uv run python scripts/run_ui.py --live   # real Razorpay test-mode orders
+    uv run python scripts/run_ui.py              # real Razorpay if .env has keys
+    uv run python scripts/run_ui.py --simulated  # force the offline provider
 
 Then open http://127.0.0.1:8000
+
+Both the payment provider and the intent parser are chosen by what is
+configured, not by a flag, and the choice is PRINTED at startup. A demo that
+quietly stopped making real calls -- or quietly stopped using the real model --
+would still look completely fine on screen, which is exactly the class of
+failure this project keeps writing journal entries about.
 
 The UI is a demonstration client for the API it mounts at /api. It holds no
 authorisation logic. DEMO ONLY: no authentication, and the audit view exposes
 mandate internals.
 """
 
+import os
 import sys
 import time
 
 import uvicorn
+from dotenv import load_dotenv
 
 from zerotrust.audit import AuditLog
 from zerotrust.catalog import demo_catalog
@@ -23,9 +31,11 @@ from zerotrust.checkout import CheckoutService
 from zerotrust.demo import create_demo_app
 from zerotrust.gateway import PurchaseGateway
 from zerotrust.idempotency import IdempotencyStore
-from zerotrust.intent import RuleBasedIntentParser
-from zerotrust.mandate import Mandate, MandateStore
-from zerotrust.narrate import TemplateNarrator
+from zerotrust.intent import (
+    FallbackIntentParser, GroqIntentParser, RuleBasedIntentParser,
+)
+from zerotrust.mandate import ANY_SKU, Mandate, MandateStore
+from zerotrust.narrate import GroqNarrator, TemplateNarrator
 from zerotrust.policy import PolicyEngine
 from zerotrust.provider import ProviderTimeout, SimulatedProvider
 from zerotrust.reconcile import ReconciliationScheduler, Reconciler
@@ -41,18 +51,47 @@ def _receipt(request) -> str:
 DBS = {"audit": "ui_audit.db", "policy": "ui_policy.db", "idem": "ui_idem.db"}
 
 
-def build(live: bool):
+def build(force_simulated: bool = False):
+    # Explicitly, and before anything reads os.environ. This used to happen
+    # only as a side effect of RazorpayConfig.from_env(), which meant
+    # `--simulated` never loaded .env at all -- and so silently ran without
+    # the LLM even when GROQ_API_KEY was sitting right there in the file.
+    load_dotenv()
+
     catalog = demo_catalog()
     offline_provider = SimulatedProvider()
     audit = AuditLog(DBS["audit"])
     engine = PolicyEngine(MandateStore(DBS["policy"]))
     store = IdempotencyStore(DBS["idem"])
 
-    if engine.mandates.active_for_agent(AGENT) is None:
+    # The item list is NOT the boundary here; the per-transaction cap is.
+    #
+    # ANY_SKU rather than a snapshot of today's catalog, so an item stocked
+    # later is purchasable without anyone remembering to reissue the mandate.
+    # A demo where most of the shop is unbuyable teaches the wrong lesson: it
+    # suggests the system's answer to risk is a short hardcoded list, when the
+    # interesting behaviour is a bounded agent facing a real catalog and being
+    # refused on the merits.
+    #
+    # The allowlist rule is untouched and still enforced -- this is a choice
+    # about how the DEMO mandate is configured. A merchant wanting a bounded
+    # item list still writes one, and the adversarial suite still exercises
+    # SKU_NOT_ALLOWED with its own narrower mandate.
+    existing = engine.mandates.active_for_agent(AGENT)
+    if existing is not None and ANY_SKU not in existing.allowed_skus:
+        # ui_policy.db persists between runs, so a narrower mandate issued
+        # before this change would otherwise survive and keep denying items
+        # the operator now expects to work. Config in this file wins over
+        # whatever is on disk.
+        engine.mandates.revoke(existing.mandate_id)
+        print("  mandate  : replaced a stale mandate that predated "
+              "the open catalog", flush=True)
+        existing = None
+    if existing is None:
         engine.mandates.issue(Mandate(
             agent_id=AGENT,
             max_amount_paise=50_000,
-            allowed_skus=frozenset({"SKU-COFFEE", "SKU-CAKE", "SKU-TEA"}),
+            allowed_skus=frozenset({ANY_SKU}),
             expires_at=time.time() + 24 * HOUR,
             velocity_limit=3,
             velocity_window_secs=HOUR,
@@ -60,12 +99,22 @@ def build(live: bool):
 
     faults = FaultInjector()
 
-    if live:
-        from zerotrust.config import RazorpayConfig
+    provider = None
+    if not force_simulated:
+        from zerotrust.config import MissingCredentialsError, RazorpayConfig
         from zerotrust.provider import RazorpayTestModeProvider
 
-        provider = RazorpayTestModeProvider(RazorpayConfig.from_env())
-        print("LIVE: order creation will hit the real Razorpay test-mode API")
+        try:
+            provider = RazorpayTestModeProvider(RazorpayConfig.from_env())
+        except MissingCredentialsError as exc:
+            # Not fatal, but never silent: the difference between a real order
+            # and a simulated one is invisible in the UI, so it is said here.
+            print(f"  payments : SIMULATED -- no Razorpay credentials ({exc})", flush=True)
+
+    live = provider is not None
+    if live:
+        print("  payments : LIVE -- real Razorpay test-mode orders (no real money)",
+              flush=True)
 
         def execute(request):
             if faults.fire_once(Fault.PROVIDER_TIMEOUT):
@@ -74,6 +123,8 @@ def build(live: bool):
             return provider.create_order(
                 request.amount_paise, "INR", receipt=_receipt(request))
     else:
+        if force_simulated:
+            print("  payments : SIMULATED -- forced with --simulated", flush=True)
         counter = {"n": 0}
 
         def execute(request):
@@ -85,8 +136,25 @@ def build(live: bool):
                 request.amount_paise, receipt=_receipt(request))
 
     gateway = PurchaseGateway(engine, store, execute, audit=audit)
+
+    # The agent is a real LLM when one is configured. The fallback is not a
+    # nicety: a rate limit or a dropped connection would otherwise take the
+    # whole chat surface down. Which parser actually ran is stamped onto every
+    # ParsedIntent, so a downgrade shows in the UI and in the audit log rather
+    # than passing for the real thing.
+    rule_based = RuleBasedIntentParser(catalog)
+    if os.environ.get("GROQ_API_KEY"):
+        parser = FallbackIntentParser(GroqIntentParser(catalog), rule_based)
+        narrator = GroqNarrator()
+        print(f"  agent    : Groq ({parser.primary.model}), "
+              f"falling back to {rule_based.name}", flush=True)
+    else:
+        parser, narrator = rule_based, TemplateNarrator()
+        print("  agent    : rule-based -- no GROQ_API_KEY, so no LLM is in use",
+              flush=True)
+
     checkout = CheckoutService(catalog, gateway,
-                               parser=RuleBasedIntentParser(catalog),
+                               parser=parser,
                                audit=audit,
                                server_identity=ServerIdentity())
 
@@ -103,12 +171,13 @@ def build(live: bool):
 
     return create_demo_app(checkout, engine, audit, catalog, agent_id=AGENT,
                            faults=faults, scheduler=scheduler,
-                           narrator=TemplateNarrator())
+                           narrator=narrator,
+                           payments_mode="razorpay-test" if live else "simulated")
 
 
 def main() -> int:
-    live = "--live" in sys.argv
-    app = build(live)
+    # --live is still accepted; it is now the default when credentials exist.
+    app = build(force_simulated="--simulated" in sys.argv)
     from zerotrust.demo import FRONTEND_DIST
 
     print("\n  Reference client on http://127.0.0.1:8000")
