@@ -7,6 +7,7 @@ dependencies = [
     "anthropic>=1.1.0",
     "fastapi>=0.141.1",
     "httpx>=0.28.1",
+    "pynacl>=1.6.2",
     "python-dotenv>=1.2.3",
     "uvicorn>=0.52.4",
 ]
