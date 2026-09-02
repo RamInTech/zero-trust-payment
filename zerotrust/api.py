@@ -23,6 +23,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from zerotrust.checkout import CheckoutError, CheckoutService
+from zerotrust.e2e import SealedText
 from zerotrust.explain import UnknownRequest, explain
 from zerotrust.narrate import ExplanationWriter
 from zerotrust.provider import ProviderTimeout
@@ -36,12 +37,25 @@ _CODE_STATUS = {
     "PRICE_MISMATCH": 409,
     "NEEDS_CLARIFICATION": 422,
     "NO_PARSER": 501,
+    "NO_E2E": 501,
+    "DECRYPTION_FAILED": 400,
 }
+
+
+class SealedTextRequest(BaseModel):
+    """A customer's message, encrypted client-side to the server's public
+    key (`GET /e2e/public-key`) before it ever left the browser."""
+
+    ciphertext_b64: str
+    sender_public_key_b64: str
 
 
 class IntentRequest(BaseModel):
     agent_id: str
-    text: str = Field(..., description="natural language purchase request")
+    text: Optional[str] = Field(
+        None, description="natural language purchase request, in plain text")
+    sealed: Optional[SealedTextRequest] = Field(
+        None, description="the same request, end-to-end encrypted instead")
 
 
 class StructuredRequest(BaseModel):
@@ -85,14 +99,33 @@ def create_app(
 
     @app.post("/intents", status_code=201)
     def create_intent(body: IntentRequest):
-        """Natural language in. Returns a DRAFT for a human to confirm."""
+        """Natural language in, plain or end-to-end encrypted. Returns a
+        DRAFT for a human to confirm."""
         try:
-            pending = checkout.propose_from_text(body.agent_id, body.text)
+            if body.sealed is not None:
+                sealed = SealedText(body.sealed.ciphertext_b64,
+                                    body.sealed.sender_public_key_b64)
+                pending = checkout.propose_from_text(body.agent_id, sealed=sealed)
+            else:
+                pending = checkout.propose_from_text(body.agent_id, body.text)
         except CheckoutError as exc:
             _fail(exc)
         return {
             "awaiting_confirmation": pending.as_dict(),
             "note": "no policy check has run yet; confirmation is required first",
+        }
+
+    @app.get("/e2e/public-key")
+    def e2e_public_key():
+        """The server's X25519 public key, so a browser can encrypt a
+        purchase request to it before sending. See `zerotrust/e2e.py`."""
+        if checkout.server_identity is None:
+            raise HTTPException(
+                status_code=501,
+                detail={"reason": "end-to-end encryption not configured on this server"})
+        return {
+            "public_key_b64": checkout.server_identity.public_key_b64,
+            "algorithm": "x25519-xsalsa20-poly1305",
         }
 
     @app.post("/purchase-intents", status_code=201)

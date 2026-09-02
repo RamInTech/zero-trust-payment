@@ -37,6 +37,7 @@ from typing import Callable, Optional
 
 from zerotrust.audit import Actor, AuditLog, EventType
 from zerotrust.catalog import Catalog, ItemNotInCatalog
+from zerotrust.e2e import DecryptionFailed, SealedText, ServerIdentity
 from zerotrust.gateway import PurchaseGateway, PurchaseOutcome
 from zerotrust.intent import IntentParser, ParsedIntent
 from zerotrust.policy import Decision, PurchaseRequest, Rule
@@ -106,6 +107,7 @@ class CheckoutService:
         audit: Optional[AuditLog] = None,
         clock: Callable[[], float] = time.time,
         pending_ttl_seconds: float = DEFAULT_PENDING_TTL_SECONDS,
+        server_identity: Optional[ServerIdentity] = None,
     ) -> None:
         self.catalog = catalog
         self.gateway = gateway
@@ -115,6 +117,10 @@ class CheckoutService:
         self.pending_ttl_seconds = pending_ttl_seconds
         self._pending: dict[str, PendingPurchase] = {}
         self._lock = threading.Lock()
+        # Present only when end-to-end encrypted chat is wired up. Its
+        # absence is not an error -- callers that never send `sealed` text
+        # never need it.
+        self.server_identity = server_identity
 
     # -- step 1: propose ---------------------------------------------------
 
@@ -174,24 +180,50 @@ class CheckoutService:
         )
         return pending
 
-    def propose_from_text(self, agent_id: str, text: str) -> PendingPurchase:
+    def propose_from_text(
+        self, agent_id: str, text: Optional[str] = None,
+        *, sealed: Optional[SealedText] = None,
+    ) -> PendingPurchase:
         """Natural language -> structured draft -> shown for confirmation.
 
         No policy check happens here. The LLM's output is a proposal; it goes
         to a human before it goes anywhere near authorisation.
+
+        Pass `sealed` instead of `text` for end-to-end encrypted input (see
+        `zerotrust/e2e.py`): the plaintext is recovered only in memory, for
+        parsing, and the audit log records the ciphertext -- never the words.
         """
         if self.parser is None:
             raise CheckoutError("no intent parser configured",
                                 code="NO_PARSER")
 
+        if sealed is not None:
+            if self.server_identity is None:
+                raise CheckoutError(
+                    "no end-to-end encryption configured on this server",
+                    code="NO_E2E")
+            try:
+                text = self.server_identity.open(sealed)
+            except DecryptionFailed as exc:
+                raise CheckoutError(f"could not decrypt request: {exc}",
+                                    code="DECRYPTION_FAILED") from exc
+        if text is None:
+            raise CheckoutError("no text or sealed text provided",
+                                code="NEEDS_CLARIFICATION")
+
         intent = self.parser.parse(text)
         request_id_for_log = AuditLog.new_request_id()
+        details = {"sku": intent.sku, "understood": intent.understood,
+                   "parser": intent.parser}
+        details.update(
+            {"raw_text_sealed": sealed.as_dict()} if sealed is not None
+            else {"raw_text": text}
+        )
         self._log(
             EventType.INTENT_PARSED, Actor.AGENT,
             request_id=request_id_for_log, agent_id=agent_id,
             reason=intent.clarification,
-            details={"raw_text": text, "sku": intent.sku,
-                     "understood": intent.understood, "parser": intent.parser},
+            details=details,
         )
 
         if intent.needs_clarification:
