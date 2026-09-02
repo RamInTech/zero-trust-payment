@@ -17,6 +17,7 @@ import uvicorn
 
 from zerotrust.audit import AuditLog
 from zerotrust.catalog import demo_catalog
+from zerotrust.e2e import ServerIdentity
 from zerotrust.faults import Fault, FaultInjector
 from zerotrust.checkout import CheckoutService
 from zerotrust.demo import create_demo_app
@@ -86,7 +87,8 @@ def build(live: bool):
     gateway = PurchaseGateway(engine, store, execute, audit=audit)
     checkout = CheckoutService(catalog, gateway,
                                parser=RuleBasedIntentParser(catalog),
-                               audit=audit)
+                               audit=audit,
+                               server_identity=ServerIdentity())
 
     # The periodic sweep, so a purchase whose outcome is unknown resolves
     # itself instead of waiting for somebody to notice.
