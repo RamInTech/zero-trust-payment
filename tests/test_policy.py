@@ -514,3 +514,73 @@ def test_malformed_input_is_still_judged_before_the_cooldown(engine, clock):
     decision = engine.evaluate(
         PurchaseRequest("agent_grind", "SKU-COFFEE", -1, "bad"))
     assert decision.rule is Rule.MALFORMED_REQUEST
+
+
+# -- ANY_SKU: the cap is the boundary, not the item list -------------------
+
+def test_any_sku_allows_an_item_not_named_in_the_mandate(engine, clock):
+    """A wildcard mandate covers items stocked after it was issued."""
+    from zerotrust.mandate import ANY_SKU
+
+    engine.mandates.issue(Mandate(
+        agent_id="agent_open", max_amount_paise=50_000,
+        allowed_skus=frozenset({ANY_SKU}),
+        expires_at=clock() + HOUR, velocity_limit=10, velocity_window_secs=HOUR))
+
+    decision = engine.evaluate(PurchaseRequest(
+        agent_id="agent_open", sku="SKU-STOCKED-LATER",
+        amount_paise=10_000, idempotency_key="k_any_1"))
+    assert decision.approved
+
+
+def test_any_sku_does_not_disable_the_amount_cap(engine, clock):
+    """Opening the item list must not open the wallet.
+
+    This is the whole point of the wildcard: refusal moves to the cap, it does
+    not disappear.
+    """
+    from zerotrust.mandate import ANY_SKU
+
+    engine.mandates.issue(Mandate(
+        agent_id="agent_open2", max_amount_paise=50_000,
+        allowed_skus=frozenset({ANY_SKU}),
+        expires_at=clock() + HOUR, velocity_limit=10, velocity_window_secs=HOUR))
+
+    decision = engine.evaluate(PurchaseRequest(
+        agent_id="agent_open2", sku="SKU-ANYTHING",
+        amount_paise=90_000, idempotency_key="k_any_2"))
+    assert not decision.approved
+    assert decision.rule is Rule.AMOUNT_EXCEEDS_CAP
+
+
+def test_an_empty_allowlist_still_allows_nothing(engine, clock):
+    """The wildcard must be reachable only deliberately.
+
+    An empty set is what you get by forgetting to populate the allowlist, and
+    it has to keep failing closed -- otherwise the sentinel would have turned
+    a mistake into permission.
+    """
+    engine.mandates.issue(Mandate(
+        agent_id="agent_empty", max_amount_paise=50_000,
+        allowed_skus=frozenset(),
+        expires_at=clock() + HOUR, velocity_limit=10, velocity_window_secs=HOUR))
+
+    decision = engine.evaluate(PurchaseRequest(
+        agent_id="agent_empty", sku="SKU-COFFEE",
+        amount_paise=10_000, idempotency_key="k_any_3"))
+    assert not decision.approved
+    assert decision.rule is Rule.SKU_NOT_ALLOWED
+
+
+def test_an_explicit_allowlist_is_still_enforced(engine, clock):
+    """The rule is unchanged; only the demo's configuration of it moved."""
+    engine.mandates.issue(Mandate(
+        agent_id="agent_listed", max_amount_paise=50_000,
+        allowed_skus=frozenset({"SKU-COFFEE"}),
+        expires_at=clock() + HOUR, velocity_limit=10, velocity_window_secs=HOUR))
+
+    decision = engine.evaluate(PurchaseRequest(
+        agent_id="agent_listed", sku="SKU-CAKE",
+        amount_paise=10_000, idempotency_key="k_any_4"))
+    assert not decision.approved
+    assert decision.rule is Rule.SKU_NOT_ALLOWED

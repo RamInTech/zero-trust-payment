@@ -156,6 +156,42 @@ def test_plaintext_calls_still_log_plaintext_unchanged(checkout_env):
     assert "raw_text_sealed" not in entries[0].details
 
 
+def test_the_parse_is_reachable_from_the_purchase_it_produced(checkout_env):
+    """The parse and the purchase must share one request_id.
+
+    Storing ciphertext is only half the guarantee. If INTENT_PARSED is filed
+    under an id nothing else references, the trail from an executed purchase
+    back to the agent's original proposal is broken -- and the encrypted
+    request becomes unreachable evidence rather than evidence.
+    """
+    checkout, audit, identity = (
+        checkout_env["checkout"], checkout_env["audit"], checkout_env["identity"])
+    sender_sk, _ = generate_keypair()
+    sealed = seal("buy filter coffee", sender_sk, identity.public_key_b64)
+
+    pending = checkout.propose_from_text(AGENT, sealed=sealed)
+
+    from zerotrust.audit import EventType
+    scoped = audit.for_request(pending.request_id)
+    parsed = [e for e in scoped if e.event_type == EventType.INTENT_PARSED]
+    assert len(parsed) == 1, (
+        "the parse that produced this purchase is not in its own audit trail")
+    assert "raw_text_sealed" in parsed[0].details
+
+
+def test_a_clarification_still_logs_the_parse_under_its_own_id(checkout_env):
+    """An ambiguous ask produces no purchase, so its parse stands alone."""
+    checkout, audit = checkout_env["checkout"], checkout_env["audit"]
+
+    with pytest.raises(CheckoutError):
+        checkout.propose_from_text(AGENT, "coffee or tea?")
+
+    from zerotrust.audit import EventType
+    entries = [e for e in audit.all() if e.event_type == EventType.INTENT_PARSED]
+    assert len(entries) == 1
+    assert entries[0].request_id
+
+
 def test_sealed_text_without_a_configured_identity_is_refused(checkout_env):
     checkout = checkout_env["checkout"]
     checkout.server_identity = None
@@ -256,3 +292,74 @@ def test_the_stored_audit_entry_for_a_sealed_request_is_unreadable_over_http(api
     assert "raw_text" not in entries[0].details
     ciphertext = entries[0].details["raw_text_sealed"]["ciphertext_b64"]
     assert "nobody" not in base64.b64decode(ciphertext).decode("latin-1")
+
+
+# -- the claim is bounded, and the boundary is published -------------------
+
+@pytest.fixture
+def demo_stack(tmp_path):
+    """The demo app, so the Security Hub payload can be read as the UI reads it."""
+    from zerotrust.demo import create_demo_app
+
+    catalog = demo_catalog()
+    audit = AuditLog(str(tmp_path / "audit.db"))
+    engine = PolicyEngine(MandateStore(str(tmp_path / "policy.db")))
+    engine.mandates.issue(Mandate(
+        agent_id=AGENT, max_amount_paise=50_000,
+        allowed_skus=frozenset({"SKU-COFFEE"}),
+        expires_at=10_000_000_000.0, velocity_limit=5, velocity_window_secs=HOUR))
+    store = IdempotencyStore(str(tmp_path / "idem.db"))
+    gateway = PurchaseGateway(
+        engine, store, lambda r: {"order_id": "order_1"}, audit=audit)
+    checkout = CheckoutService(catalog, gateway,
+                               parser=RuleBasedIntentParser(catalog), audit=audit,
+                               server_identity=ServerIdentity())
+    app = create_demo_app(checkout, engine, audit, catalog, agent_id=AGENT)
+    return {"client": TestClient(app), "checkout": checkout}
+
+
+@pytest.fixture
+def demo_client(demo_stack):
+    return demo_stack["client"]
+
+
+def _layer(client, layer_id="e2e_chat_encryption"):
+    body = client.get("/demo/security/layers").json()
+    return next(l for l in body["implemented"] if l["id"] == layer_id)
+
+
+def test_the_encryption_card_states_what_it_does_not_protect(demo_client):
+    """'Encrypted' must not be allowed to imply 'nobody can read it'.
+
+    The running server decrypts to parse. Publishing the mechanism without
+    publishing that boundary is the overclaim this Hub exists to avoid.
+    """
+    boundary = _layer(demo_client)["boundary"].lower()
+    assert "at rest" in boundary
+    assert "does not hide" in boundary
+    assert "decrypt" in boundary
+
+
+def test_a_deterministic_parser_reports_no_external_recipient(demo_client):
+    """With no LLM in use, nothing leaves the process -- and it says so."""
+    layer = _layer(demo_client)
+    assert layer["evidence"]["decrypted_text_sent_to"] == "nothing external"
+    assert "api it is sent to" not in layer["boundary"].lower()
+
+
+def test_an_llm_parser_discloses_that_decrypted_text_is_sent_to_it(demo_stack):
+    """The disclosure must follow the parser actually configured.
+
+    Swapping in an LLM parser widens who can read a customer's message. If the
+    card kept saying only the server sees it, the page would be lying by
+    omission the moment the demo got more capable.
+    """
+    from zerotrust.intent import FallbackIntentParser, GroqIntentParser, RuleBasedIntentParser
+
+    catalog = demo_stack["checkout"].catalog
+    demo_stack["checkout"].parser = FallbackIntentParser(
+        GroqIntentParser(catalog, client=object()), RuleBasedIntentParser(catalog))
+
+    layer = _layer(demo_stack["client"])
+    assert layer["evidence"]["decrypted_text_sent_to"] == "groq"
+    assert "groq api it is sent to for parsing" in layer["boundary"].lower()

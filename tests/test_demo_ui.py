@@ -509,3 +509,149 @@ def test_an_ambiguous_message_returns_the_parsers_own_words(stack):
     assert detail["code"] == "NEEDS_CLARIFICATION"
     assert "ambiguous" in detail["reason"]
     assert len(stack["calls"]) == 0
+
+
+# -- the merchant sets the boundary; the agent never can -------------------
+
+def open_the_catalog(stack):
+    """Reissue this agent's mandate with the ANY_SKU wildcard.
+
+    The default fixture mandate lists three SKUs on purpose, because other
+    tests here need SKU_NOT_ALLOWED to fire. Tests about the CAP have to clear
+    the allowlist out of the way first, or they quietly measure the wrong rule.
+    """
+    from zerotrust.mandate import ANY_SKU
+
+    engine = stack["engine"]
+    current = engine.mandates.active_for_agent(AGENT)
+    engine.mandates.revoke(current.mandate_id)
+    engine.mandates.issue(Mandate(
+        agent_id=AGENT, max_amount_paise=current.max_amount_paise,
+        allowed_skus=frozenset({ANY_SKU}),
+        expires_at=current.expires_at,
+        velocity_limit=20, velocity_window_secs=current.velocity_window_secs))
+
+
+def test_the_merchant_can_raise_the_per_transaction_cap(stack):
+    open_the_catalog(stack)
+    client = stack["client"]
+
+    over_cap = client.post("/api/purchase-intents",
+                           json={"agent_id": AGENT, "sku": "SKU-BEANS"})
+    rid = over_cap.json()["awaiting_confirmation"]["request_id"]
+    denied = client.post(f"/api/intents/{rid}/confirm", json={})
+    assert denied.json()["rule"] == "AMOUNT_EXCEEDS_CAP"
+
+    raised = client.post(f"/demo/mandate/{AGENT}/cap",
+                         json={"max_amount_paise": 200_000})
+    assert raised.status_code == 200
+    assert raised.json()["was_paise"] == 50_000
+
+    again = client.post("/api/purchase-intents",
+                        json={"agent_id": AGENT, "sku": "SKU-BEANS"})
+    rid2 = again.json()["awaiting_confirmation"]["request_id"]
+    assert client.post(f"/api/intents/{rid2}/confirm", json={}).json()["approved"]
+
+
+def test_lowering_the_cap_takes_effect_immediately(stack):
+    client = stack["client"]
+    client.post(f"/demo/mandate/{AGENT}/cap", json={"max_amount_paise": 10_000})
+    created = client.post("/api/purchase-intents",
+                          json={"agent_id": AGENT, "sku": "SKU-COFFEE"})
+    rid = created.json()["awaiting_confirmation"]["request_id"]
+    body = client.post(f"/api/intents/{rid}/confirm", json={}).json()
+    assert not body["approved"]
+    assert body["rule"] == "AMOUNT_EXCEEDS_CAP"
+
+
+def test_changing_the_cap_replaces_rather_than_edits_the_mandate(stack):
+    """Mandates are immutable; history of what was permitted must survive."""
+    before = stack["engine"].mandates.active_for_agent(AGENT)
+    stack["client"].post(f"/demo/mandate/{AGENT}/cap",
+                         json={"max_amount_paise": 123_400})
+    after = stack["engine"].mandates.active_for_agent(AGENT)
+
+    assert after.mandate_id != before.mandate_id
+    assert after.max_amount_paise == 123_400
+    old = stack["engine"].mandates.get(before.mandate_id)
+    assert old.max_amount_paise == 50_000      # untouched
+    assert old.is_revoked()
+
+
+def test_a_nonsense_cap_is_refused(stack):
+    for bad in (0, -1):
+        res = stack["client"].post(f"/demo/mandate/{AGENT}/cap",
+                                   json={"max_amount_paise": bad})
+        assert res.status_code == 400
+
+
+def test_the_cap_route_does_not_exist_on_the_production_api(stack):
+    """Raising your own ceiling must not be reachable by an agent."""
+    assert stack["client"].post(f"/api/demo/mandate/{AGENT}/cap",
+                                json={"max_amount_paise": 999_999}
+                                ).status_code in (404, 405)
+
+
+# -- stocking new items ----------------------------------------------------
+
+def test_a_newly_stocked_item_can_be_purchased(stack):
+    open_the_catalog(stack)
+    client = stack["client"]
+    added = client.post("/demo/catalog", json={
+        "sku": "SKU-TELESCOPE", "name": "Telescope", "price_paise": 12_000})
+    assert added.status_code == 200
+
+    created = client.post("/api/purchase-intents",
+                          json={"agent_id": AGENT, "sku": "SKU-TELESCOPE"})
+    assert created.status_code == 201
+    rid = created.json()["awaiting_confirmation"]["request_id"]
+    assert client.post(f"/api/intents/{rid}/confirm", json={}).json()["approved"]
+
+
+def test_a_new_item_reports_whether_the_mandate_actually_covers_it(stack):
+    """This fixture's mandate lists three SKUs, so a new one is NOT covered.
+
+    Saying so at stocking time beats letting the operator discover it as a
+    confusing denial later.
+    """
+    body = stack["client"].post("/demo/catalog", json={
+        "sku": "SKU-HARMONICA", "name": "Harmonica", "price_paise": 5_000}).json()
+    assert body["purchasable_by_agent"] is False
+
+
+def test_a_stocked_item_still_faces_the_cap(stack):
+    open_the_catalog(stack)
+    client = stack["client"]
+    client.post("/demo/catalog", json={
+        "sku": "SKU-DESK", "name": "Desk", "price_paise": 400_000})
+    created = client.post("/api/purchase-intents",
+                          json={"agent_id": AGENT, "sku": "SKU-DESK"})
+    rid = created.json()["awaiting_confirmation"]["request_id"]
+    body = client.post(f"/api/intents/{rid}/confirm", json={}).json()
+    assert not body["approved"]
+
+
+def test_stocking_rejects_bad_input(stack):
+    client = stack["client"]
+    assert client.post("/demo/catalog", json={
+        "sku": "", "name": "x", "price_paise": 100}).status_code == 400
+    assert client.post("/demo/catalog", json={
+        "sku": "SKU-X", "name": "X", "price_paise": 0}).status_code == 400
+    assert client.post("/demo/catalog", json={
+        "sku": "SKU-COFFEE", "name": "Dup", "price_paise": 100}).status_code == 409
+
+
+def test_the_price_of_a_stocked_item_comes_from_the_merchant_not_the_request(stack):
+    """The invariant that makes confirm-time re-validation mean anything."""
+    open_the_catalog(stack)
+    client = stack["client"]
+    client.post("/demo/catalog", json={
+        "sku": "SKU-LAMP", "name": "Lamp", "price_paise": 30_000})
+    created = client.post("/api/purchase-intents",
+                          json={"agent_id": AGENT, "sku": "SKU-LAMP"})
+    shown = created.json()["awaiting_confirmation"]["displayed_amount_paise"]
+    assert shown == 30_000
+
+    rid = created.json()["awaiting_confirmation"]["request_id"]
+    lying = client.post(f"/api/intents/{rid}/confirm", json={"amount_paise": 1})
+    assert lying.status_code == 409

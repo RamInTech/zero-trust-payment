@@ -16,7 +16,7 @@ from zerotrust.catalog import Catalog, CatalogItem, demo_catalog
 from zerotrust.checkout import CheckoutError, CheckoutService, PendingStatus
 from zerotrust.gateway import PurchaseGateway
 from zerotrust.idempotency import IdempotencyStore, Outcome
-from zerotrust.intent import ParsedIntent, RuleBasedIntentParser
+from zerotrust.intent import ParsedIntent, ParsedItem, RuleBasedIntentParser
 from zerotrust.mandate import Mandate, MandateStore
 from zerotrust.policy import PolicyEngine, Rule
 
@@ -516,3 +516,113 @@ def test_gateway_still_logs_the_intent_when_called_directly(engine, audit,
 
     assert audit.count_of(EventType.PURCHASE_REQUESTED,
                           request_id=outcome.request_id) == 1
+
+
+# -- baskets: one request, several independent transactions ----------------
+
+class BasketParser:
+    """Returns a fixed multi-line parse, as an LLM would for 'two X and a Y'."""
+
+    name = "basket-stub"
+
+    def __init__(self, lines):
+        self.lines = lines
+
+    def parse(self, text):
+        first, *rest = self.lines
+        return ParsedIntent(
+            sku=first[0], quantity=first[1], understood=True, raw_text=text,
+            parser=self.name,
+            extra_items=tuple(ParsedItem(sku, q) for sku, q in rest),
+        )
+
+
+def test_a_basket_becomes_one_pending_purchase_per_line(checkout, mandate):
+    checkout.parser = BasketParser([("SKU-COLA", 2), ("SKU-WATER", 1)])
+    basket = checkout.propose_basket_from_text(AGENT, "two colas and a water")
+
+    assert [p.sku for p in basket] == ["SKU-COLA", "SKU-WATER"]
+    assert [p.quantity for p in basket] == [2, 1]
+
+
+def test_each_line_gets_its_own_idempotency_key(checkout, mandate):
+    """Exactly-once is a property of a single money action, not of a basket."""
+    checkout.parser = BasketParser([("SKU-COLA", 1), ("SKU-WATER", 1)])
+    basket = checkout.propose_basket_from_text(AGENT, "cola and water")
+    assert len({p.idempotency_key for p in basket}) == len(basket)
+
+
+def test_each_line_gets_its_own_request_id(checkout, mandate):
+    """Separate transactions must be separately explainable."""
+    checkout.parser = BasketParser([("SKU-COLA", 1), ("SKU-WATER", 1)])
+    basket = checkout.propose_basket_from_text(AGENT, "cola and water")
+    assert len({p.request_id for p in basket}) == len(basket)
+
+
+def test_the_basket_total_is_the_sum_of_its_lines(checkout, mandate):
+    checkout.parser = BasketParser([("SKU-COLA", 2), ("SKU-WATER", 1)])
+    basket = checkout.propose_basket_from_text(AGENT, "two colas and a water")
+
+    cola = checkout.catalog.get("SKU-COLA").price_paise
+    water = checkout.catalog.get("SKU-WATER").price_paise
+    assert sum(p.displayed_amount_paise for p in basket) == cola * 2 + water
+
+
+def test_a_single_item_request_is_a_basket_of_one(checkout, mandate):
+    checkout.parser = BasketParser([("SKU-COFFEE", 1)])
+    assert len(checkout.propose_basket_from_text(AGENT, "coffee")) == 1
+
+
+def test_an_unclear_basket_asks_rather_than_partially_buying(checkout, mandate):
+    class Unclear:
+        name = "unclear"
+
+        def parse(self, text):
+            return ParsedIntent(understood=False, clarification="which one?",
+                                raw_text=text, parser=self.name)
+
+    checkout.parser = Unclear()
+    with pytest.raises(CheckoutError) as exc:
+        checkout.propose_basket_from_text(AGENT, "the usual")
+    assert exc.value.code == "NEEDS_CLARIFICATION"
+
+
+def test_one_denied_line_does_not_block_the_others(checkout, mandate):
+    """Partial failure must be survivable, not all-or-nothing.
+
+    SKU-PHONE is far over the cap; the cola beside it is not. The basket must
+    end with one refusal and one real purchase.
+    """
+    # SKU-COFFEE, not a cola: this fixture's mandate lists a few SKUs, so an
+    # unlisted item would be denied for the wrong reason and the test would
+    # stop measuring "the surviving line still executes".
+    checkout.parser = BasketParser([("SKU-PHONE", 1), ("SKU-COFFEE", 1)])
+    basket = checkout.propose_basket_from_text(AGENT, "a phone and a coffee")
+
+    outcomes = [checkout.confirm(p.request_id) for p in basket]
+    assert not outcomes[0].approved
+    assert outcomes[0].rule is Rule.AMOUNT_EXCEEDS_CAP
+    assert outcomes[1].approved and outcomes[1].executed
+    assert len(checkout.calls) == 1
+
+
+def test_the_cap_applies_per_line_not_to_the_basket_total(checkout, mandate):
+    """A basket cannot average an expensive item under the cap.
+
+    Two cakes at Rs.450 total Rs.900, over the Rs.500 cap, yet each line is its
+    own transaction and each is within it. The cap means per-transaction, and
+    this pins that reading rather than leaving it to be assumed.
+    """
+    checkout.parser = BasketParser([("SKU-CAKE", 1), ("SKU-CAKE", 1)])
+    basket = checkout.propose_basket_from_text(AGENT, "two cakes")
+    assert all(checkout.confirm(p.request_id).approved for p in basket)
+
+
+def test_the_parse_is_logged_once_for_the_whole_basket(checkout, audit, mandate):
+    checkout.parser = BasketParser([("SKU-COLA", 1), ("SKU-WATER", 1)])
+    checkout.propose_basket_from_text(AGENT, "cola and water")
+
+    parsed = [e for e in audit.all() if e.event_type == EventType.INTENT_PARSED]
+    assert len(parsed) == 1
+    assert [i["sku"] for i in parsed[0].details["line_items"]] == [
+        "SKU-COLA", "SKU-WATER"]

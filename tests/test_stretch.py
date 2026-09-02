@@ -24,7 +24,9 @@ from zerotrust.gateway import PurchaseGateway
 from zerotrust.idempotency import COMPLETED, IdempotencyStore
 from zerotrust.intent import RuleBasedIntentParser
 from zerotrust.mandate import Mandate, MandateStore
-from zerotrust.narrate import ClaudeNarrator, ExplanationWriter, TemplateNarrator
+from zerotrust.narrate import (
+    ClaudeNarrator, ExplanationWriter, GroqNarrator, TemplateNarrator,
+)
 from zerotrust.policy import PolicyEngine, PurchaseRequest, Rule
 from zerotrust.provider import ProviderTimeout, SimulatedProvider
 from zerotrust.reconcile import (
@@ -335,7 +337,8 @@ def test_a_narrator_holds_no_writable_component():
     The same argument that keeps ParsedIntent unable to state a price -- the
     capability is absent, not merely unused.
     """
-    for narrator in (TemplateNarrator(), ClaudeNarrator(client=object())):
+    for narrator in (TemplateNarrator(), ClaudeNarrator(client=object()),
+                     GroqNarrator(client=object())):
         for attribute in vars(narrator).values():
             for forbidden in ("execute", "record", "resolve_verified",
                               "confirm_slot", "issue", "evaluate"):
@@ -478,3 +481,67 @@ def test_concurrent_agents_do_not_contaminate_each_other(many_agents, run):
         for decision in results[agent_id]:
             if decision.denied:
                 assert decision.rule is Rule.VELOCITY_EXCEEDED
+
+
+# -- the Groq-backed narrator ----------------------------------------------
+
+class StubGroqNarratorClient:
+    """Groq's OpenAI-shaped surface, returning whatever the test dictates."""
+
+    def __init__(self, text: str = "A purchase was refused for exceeding its limit."):
+        self.text = text
+        self.calls = []
+        self.chat = self
+        self.completions = self
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        body = self.text
+
+        class _Message:
+            content = body
+
+        class _Choice:
+            message = _Message()
+
+        class _Response:
+            choices = [_Choice()]
+
+        return _Response()
+
+
+def test_the_groq_narrator_satisfies_the_protocol():
+    assert isinstance(GroqNarrator(client=StubGroqNarratorClient()), ExplanationWriter)
+
+
+def test_the_groq_narrator_returns_the_models_sentence():
+    narrator = GroqNarrator(client=StubGroqNarratorClient("Refused: over the cap."))
+    assert narrator.narrate(entry()) == "Refused: over the cap."
+
+
+def test_a_failing_groq_narrator_falls_back_rather_than_breaking():
+    """An explanation must not disappear because a model call failed."""
+    class Broken:
+        def __init__(self):
+            self.chat = self
+            self.completions = self
+
+        def create(self, **kwargs):
+            raise RuntimeError("api down")
+
+    text = GroqNarrator(client=Broken()).narrate(entry())
+    assert "AMOUNT_EXCEEDS_CAP" in text
+
+
+def test_an_empty_groq_response_falls_back_to_the_template():
+    """A model that returns nothing is a failure too, just a quieter one."""
+    text = GroqNarrator(client=StubGroqNarratorClient("   ")).narrate(entry())
+    assert "AMOUNT_EXCEEDS_CAP" in text
+
+
+def test_the_groq_narrator_is_told_it_has_no_authority():
+    client = StubGroqNarratorClient()
+    GroqNarrator(client=client).narrate(entry())
+    system = client.calls[0]["messages"][0]
+    assert system["role"] == "system"
+    assert "no authority" in system["content"].lower()
