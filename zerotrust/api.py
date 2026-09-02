@@ -101,17 +101,26 @@ def create_app(
     def create_intent(body: IntentRequest):
         """Natural language in, plain or end-to-end encrypted. Returns a
         DRAFT for a human to confirm."""
+        sealed = None
+        if body.sealed is not None:
+            sealed = SealedText(body.sealed.ciphertext_b64,
+                                body.sealed.sender_public_key_b64)
         try:
-            if body.sealed is not None:
-                sealed = SealedText(body.sealed.ciphertext_b64,
-                                    body.sealed.sender_public_key_b64)
-                pending = checkout.propose_from_text(body.agent_id, sealed=sealed)
-            else:
-                pending = checkout.propose_from_text(body.agent_id, body.text)
+            basket = checkout.propose_basket_from_text(
+                body.agent_id, body.text, sealed=sealed)
         except CheckoutError as exc:
             _fail(exc)
+
         return {
-            "awaiting_confirmation": pending.as_dict(),
+            # The first line, kept under the original key so every existing
+            # client and test keeps working. A single-item request is just a
+            # basket of one.
+            "awaiting_confirmation": basket[0].as_dict(),
+            "basket": [p.as_dict() for p in basket],
+            # A DISPLAY figure. It is not an amount anyone is authorised to
+            # spend: each line is confirmed and policy-checked on its own, and
+            # the per-transaction cap applies to each line, not to this sum.
+            "basket_total_paise": sum(p.displayed_amount_paise for p in basket),
             "note": "no policy check has run yet; confirmation is required first",
         }
 

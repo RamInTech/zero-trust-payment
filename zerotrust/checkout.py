@@ -127,14 +127,19 @@ class CheckoutService:
     def propose(
         self, agent_id: str, sku: str, quantity: int = 1,
         parsed: Optional[ParsedIntent] = None,
+        *, request_id: Optional[str] = None,
     ) -> PendingPurchase:
         """Build a request from a STRUCTURED ask and show it for confirmation.
 
         The catalog check happens here -- before the policy engine ever runs --
         so an item that doesn't exist is rejected without consuming a velocity
         slot or producing a policy decision about a fictional product.
+
+        `request_id` lets a caller that has already logged against an id adopt
+        it, so the whole request shares one trail. `propose_from_text` uses it
+        to keep the parse and the purchase it produced correlated.
         """
-        request_id = AuditLog.new_request_id()
+        request_id = request_id or AuditLog.new_request_id()
         try:
             item = self.catalog.get(sku)
         except ItemNotInCatalog as exc:
@@ -180,6 +185,51 @@ class CheckoutService:
         )
         return pending
 
+    def _plaintext(self, text: Optional[str],
+                   sealed: Optional[SealedText]) -> str:
+        """Recover the request text, decrypting in memory when sealed."""
+        if sealed is not None:
+            if self.server_identity is None:
+                raise CheckoutError(
+                    "no end-to-end encryption configured on this server",
+                    code="NO_E2E")
+            try:
+                return self.server_identity.open(sealed)
+            except DecryptionFailed as exc:
+                raise CheckoutError(f"could not decrypt request: {exc}",
+                                    code="DECRYPTION_FAILED") from exc
+        if text is None:
+            raise CheckoutError("no text or sealed text provided",
+                                code="NEEDS_CLARIFICATION")
+        return text
+
+    def _log_parse(self, intent: ParsedIntent, text: str,
+                   sealed: Optional[SealedText], agent_id: str,
+                   request_id: str) -> None:
+        """One INTENT_PARSED entry, whichever entry point produced the parse.
+
+        Shared so the single-item and basket paths cannot drift into logging
+        different things -- and so the sealed-vs-plaintext rule (ciphertext
+        only, never the customer's words) is written once.
+        """
+        details = {"sku": intent.sku, "understood": intent.understood,
+                   "parser": intent.parser}
+        if intent.extra_items:
+            details["line_items"] = [
+                {"sku": i.sku, "quantity": i.quantity}
+                for i in intent.line_items
+            ]
+        details.update(
+            {"raw_text_sealed": sealed.as_dict()} if sealed is not None
+            else {"raw_text": text}
+        )
+        self._log(
+            EventType.INTENT_PARSED, Actor.AGENT,
+            request_id=request_id, agent_id=agent_id,
+            reason=intent.clarification,
+            details=details,
+        )
+
     def propose_from_text(
         self, agent_id: str, text: Optional[str] = None,
         *, sealed: Optional[SealedText] = None,
@@ -197,34 +247,14 @@ class CheckoutService:
             raise CheckoutError("no intent parser configured",
                                 code="NO_PARSER")
 
-        if sealed is not None:
-            if self.server_identity is None:
-                raise CheckoutError(
-                    "no end-to-end encryption configured on this server",
-                    code="NO_E2E")
-            try:
-                text = self.server_identity.open(sealed)
-            except DecryptionFailed as exc:
-                raise CheckoutError(f"could not decrypt request: {exc}",
-                                    code="DECRYPTION_FAILED") from exc
-        if text is None:
-            raise CheckoutError("no text or sealed text provided",
-                                code="NEEDS_CLARIFICATION")
-
+        text = self._plaintext(text, sealed)
         intent = self.parser.parse(text)
+        # Minted here and handed to propose() below, so the parse and the
+        # purchase it produces share one request_id. Filing the parse under a
+        # throwaway id orphaned it: an executed purchase could not be traced
+        # back to the agent's original -- and, when sealed, encrypted -- ask.
         request_id_for_log = AuditLog.new_request_id()
-        details = {"sku": intent.sku, "understood": intent.understood,
-                   "parser": intent.parser}
-        details.update(
-            {"raw_text_sealed": sealed.as_dict()} if sealed is not None
-            else {"raw_text": text}
-        )
-        self._log(
-            EventType.INTENT_PARSED, Actor.AGENT,
-            request_id=request_id_for_log, agent_id=agent_id,
-            reason=intent.clarification,
-            details=details,
-        )
+        self._log_parse(intent, text, sealed, agent_id, request_id_for_log)
 
         if intent.needs_clarification:
             # Ambiguity is asked about, never guessed into a purchase.
@@ -233,7 +263,55 @@ class CheckoutService:
                 code="NEEDS_CLARIFICATION",
             )
 
-        return self.propose(agent_id, intent.sku, intent.quantity, parsed=intent)
+        return self.propose(agent_id, intent.sku, intent.quantity, parsed=intent,
+                            request_id=request_id_for_log)
+
+    def propose_basket_from_text(
+        self, agent_id: str, text: Optional[str] = None,
+        *, sealed: Optional[SealedText] = None,
+    ) -> list[PendingPurchase]:
+        """A multi-item request -> one pending purchase PER LINE.
+
+        The basket is a presentation grouping, not a new unit of authorisation.
+        Each line gets its own idempotency key, faces the policy engine on its
+        own, and lands in the audit log as its own request. That is deliberate:
+
+        - the per-transaction cap keeps meaning "per transaction", so a basket
+          cannot be used to slip an expensive item past it by averaging;
+        - one line failing (denied, or an unknown payment outcome) leaves the
+          others unaffected, instead of an all-or-nothing batch whose partial
+          failure would be the hardest possible state to reason about;
+        - exactly-once stays a property of a single money action, which is the
+          only level at which the unique-constraint guarantee actually holds.
+
+        Velocity counts each line separately, for the same reason. A basket of
+        four items against a limit of three is three purchases and one denial,
+        which is the honest answer.
+        """
+        if self.parser is None:
+            raise CheckoutError("no intent parser configured", code="NO_PARSER")
+
+        text = self._plaintext(text, sealed)
+        intent = self.parser.parse(text)
+        request_id_for_log = AuditLog.new_request_id()
+        self._log_parse(intent, text, sealed, agent_id, request_id_for_log)
+
+        if intent.needs_clarification:
+            raise CheckoutError(
+                intent.clarification or "could not understand the request",
+                code="NEEDS_CLARIFICATION",
+            )
+
+        pendings: list[PendingPurchase] = []
+        for index, line in enumerate(intent.line_items):
+            # The first line adopts the id the parse was logged under, so that
+            # trail is not orphaned. Later lines get their own -- they are
+            # separate transactions and must be separately explainable.
+            pendings.append(self.propose(
+                agent_id, line.sku, line.quantity, parsed=intent,
+                request_id=request_id_for_log if index == 0 else None,
+            ))
+        return pendings
 
     # -- step 2: the human answers ----------------------------------------
 
