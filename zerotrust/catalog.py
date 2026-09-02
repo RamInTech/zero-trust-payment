@@ -116,7 +116,19 @@ class Catalog:
 
 
 def demo_catalog() -> Catalog:
+    """A general store, not a coffee shop.
+
+    Deliberately broad and deliberately spanning the mandate's default Rs.500
+    cap in both directions, because a catalog where everything is affordable
+    demonstrates nothing. The phone at Rs.14,999 is the clearest case: an
+    ordinary thing a person would plausibly ask for, which the agent simply
+    cannot buy on this mandate.
+
+    The first five SKUs are load-bearing -- tests and the adversarial suite
+    assert on their exact prices -- so they keep their ids and amounts.
+    """
     return Catalog([
+        # -- the original five; prices are pinned by tests ------------------
         CatalogItem("SKU-COFFEE", "Filter Coffee", 15_000,
                     description="250g pack of filter coffee"),
         CatalogItem("SKU-CAKE", "Chocolate Cake", 45_000,
@@ -127,4 +139,46 @@ def demo_catalog() -> Catalog:
                     description="Handmade ceramic mug"),
         CatalogItem("SKU-BEANS", "Arabica Beans", 90_000,
                     description="1kg single origin arabica beans"),
+
+        # -- cold drinks ----------------------------------------------------
+        CatalogItem("SKU-COLA", "Cola 500ml", 4_500,
+                    description="Chilled cola, 500ml bottle"),
+        CatalogItem("SKU-LEMONADE", "Lemon Soda", 4_000,
+                    description="Sparkling lemon soda, 330ml can"),
+        CatalogItem("SKU-JUICE", "Orange Juice", 6_000,
+                    description="No-sugar-added orange juice, 1L"),
+        CatalogItem("SKU-WATER", "Mineral Water", 2_000,
+                    description="Packaged drinking water, 1L"),
+
+        # -- snacks and groceries -------------------------------------------
+        CatalogItem("SKU-CHIPS", "Potato Chips", 3_000,
+                    description="Salted potato chips, 150g"),
+        CatalogItem("SKU-BISCUITS", "Butter Biscuits", 5_000,
+                    description="Butter biscuits, 300g pack"),
+        CatalogItem("SKU-RICE", "Basmati Rice", 32_000,
+                    description="Aged basmati rice, 5kg"),
+        CatalogItem("SKU-OIL", "Sunflower Oil", 21_000,
+                    description="Refined sunflower oil, 1L"),
+
+        # -- electronics; most of these sit ABOVE the default cap ------------
+        CatalogItem("SKU-PHONE", "Mobile Phone", 1_499_900,
+                    description="6.5-inch smartphone, 128GB"),
+        CatalogItem("SKU-EARPHONES", "Wireless Earphones", 129_900,
+                    description="Bluetooth in-ear headphones"),
+        CatalogItem("SKU-CHARGER", "Fast Charger", 69_900,
+                    description="65W USB-C fast charger"),
+        CatalogItem("SKU-POWERBANK", "Power Bank", 149_900,
+                    description="10000mAh power bank"),
+        CatalogItem("SKU-CABLE", "USB-C Cable", 29_900,
+                    description="1m braided USB-C cable"),
+
+        # -- home and stationery --------------------------------------------
+        CatalogItem("SKU-NOTEBOOK", "Notebook", 12_000,
+                    description="A5 ruled notebook, 200 pages"),
+        CatalogItem("SKU-PEN", "Gel Pen Set", 9_000,
+                    description="Pack of 5 gel pens"),
+        CatalogItem("SKU-UMBRELLA", "Umbrella", 39_900,
+                    description="Compact folding umbrella"),
+        CatalogItem("SKU-TSHIRT", "Cotton T-Shirt", 59_900,
+                    description="Plain cotton t-shirt"),
     ])
