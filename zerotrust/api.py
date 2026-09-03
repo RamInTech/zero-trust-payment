@@ -22,11 +22,13 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from zerotrust.audit import Actor, EventType
 from zerotrust.checkout import CheckoutError, CheckoutService
 from zerotrust.e2e import SealedText
 from zerotrust.explain import UnknownRequest, explain
 from zerotrust.narrate import ExplanationWriter
 from zerotrust.provider import ProviderTimeout
+from zerotrust.recommend import Recommender
 
 _CODE_STATUS = {
     "ITEM_NOT_IN_CATALOG": 404,
@@ -77,6 +79,7 @@ class ConfirmRequest(BaseModel):
 def create_app(
     checkout: CheckoutService,
     narrator: Optional[ExplanationWriter] = None,
+    recommender: Optional[Recommender] = None,
 ) -> FastAPI:
     app = FastAPI(
         title="Zero-Trust Payment Authorization for AI Agents",
@@ -122,6 +125,52 @@ def create_app(
             # the per-transaction cap applies to each line, not to this sum.
             "basket_total_paise": sum(p.displayed_amount_paise for p in basket),
             "note": "no policy check has run yet; confirmation is required first",
+        }
+
+    @app.get("/recommendations/{sku}")
+    def recommendations(sku: str, limit: int = 1):
+        """Complementary items for a purchase. Proposals, not authorisations.
+
+        Returns SKUs and reasons. It does NOT return a price the caller may
+        act on, does not pre-approve anything, and is not filtered by the
+        mandate -- a suggested item still has to survive confirmation and the
+        policy engine like any other request. Filtering here would put the
+        mandate in two places, and this copy would be the untested one.
+        """
+        if recommender is None:
+            raise HTTPException(
+                status_code=501,
+                detail={"reason": "no recommender configured on this server"})
+        if not checkout.catalog.has(sku):
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "ITEM_NOT_IN_CATALOG",
+                        "reason": f"'{sku}' is not in the catalog"})
+
+        suggestions = recommender.suggest(sku, limit=limit)
+        if checkout.audit is not None:
+            for s in suggestions:
+                checkout.audit.record(
+                    event_type=EventType.SUGGESTION_OFFERED,
+                    actor=Actor.AGENT,
+                    reason=s.reason,
+                    details={"suggested_sku": s.sku,
+                             "prompted_by_sku": s.prompted_by_sku},
+                )
+        return {
+            "prompted_by": sku,
+            "suggestions": [
+                {"sku": s.sku,
+                 "name": checkout.catalog.get(s.sku).name,
+                 # The display price, read from the catalog -- the same value
+                 # `propose()` will re-read and re-validate at confirm time,
+                 # never a number the recommender supplied.
+                 "price_paise": checkout.catalog.get(s.sku).price_paise,
+                 "reason": s.reason}
+                for s in suggestions
+            ],
+            "note": "a suggestion is a proposal; it still faces confirmation "
+                    "and the policy engine",
         }
 
     @app.get("/e2e/public-key")

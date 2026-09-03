@@ -37,6 +37,10 @@ class EventType(str, Enum):
 
     # Intent (Phase 5 will emit the LLM-specific ones)
     PURCHASE_REQUESTED = "PURCHASE_REQUESTED"
+    #: The merchant's recommender offered an add-on. Logged even when nobody
+    #: takes it, because attach rate is meaningless without the denominator --
+    #: and because an upsell nobody sees the offers for is unauditable.
+    SUGGESTION_OFFERED = "SUGGESTION_OFFERED"
     INTENT_PARSED = "INTENT_PARSED"
     PRICE_VALIDATED = "PRICE_VALIDATED"
     USER_CONFIRMED = "USER_CONFIRMED"

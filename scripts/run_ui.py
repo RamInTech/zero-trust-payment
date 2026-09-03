@@ -37,6 +37,7 @@ from zerotrust.intent import (
 from zerotrust.mandate import ANY_SKU, Mandate, MandateStore
 from zerotrust.narrate import GroqNarrator, TemplateNarrator
 from zerotrust.policy import PolicyEngine
+from zerotrust.recommend import StaticRecommender
 from zerotrust.provider import ProviderTimeout, SimulatedProvider
 from zerotrust.reconcile import ReconciliationScheduler, Reconciler
 
@@ -172,7 +173,8 @@ def build(force_simulated: bool = False):
     return create_demo_app(checkout, engine, audit, catalog, agent_id=AGENT,
                            faults=faults, scheduler=scheduler,
                            narrator=narrator,
-                           payments_mode="razorpay-test" if live else "simulated")
+                           payments_mode="razorpay-test" if live else "simulated",
+                           recommender=StaticRecommender(catalog))
 
 
 def main() -> int:
