@@ -3,7 +3,8 @@
 This wraps the production app rather than extending it:
 
     demo = FastAPI()
-    demo.mount("/api", create_app(checkout, narrator=narrator))   # unmodified
+    demo.mount("/api", create_app(checkout, narrator=narrator,
+                                  recommender=recommender))   # unmodified
 
 `zerotrust/api.py` gains nothing from this module -- not one route. The reason
 is the same one that kept FastAPI thin in the first place: a rule that lives in
@@ -36,6 +37,7 @@ from zerotrust.api import create_app
 from zerotrust.audit import AuditLog, EventType
 from zerotrust.catalog import Catalog, CatalogItem, ItemNotInCatalog
 from zerotrust.checkout import CheckoutService
+from zerotrust.explain import first_detail, provider_order_id
 from zerotrust.faults import Fault, FaultInjector
 from zerotrust.mandate import ANY_SKU, Mandate
 from zerotrust.intent import ParsedIntent
@@ -168,6 +170,7 @@ def create_demo_app(
     scheduler=None,
     narrator=None,
     payments_mode: str = "unknown",
+    recommender=None,
 ) -> FastAPI:
     demo = FastAPI(
         title="Zero-Trust Payment Authorization — reference client",
@@ -177,7 +180,8 @@ def create_demo_app(
             "policy engine behind that API."
         ),
     )
-    demo.mount("/api", create_app(checkout, narrator=narrator))
+    demo.mount("/api", create_app(checkout, narrator=narrator,
+                                  recommender=recommender))
 
     index_html = FRONTEND_DIST / "index.html"
     if index_html.exists():
@@ -349,6 +353,36 @@ def create_demo_app(
         return {"agent_id": agent,
                 "was_paise": current.max_amount_paise,
                 "now_paise": body.max_amount_paise}
+
+    @demo.post("/demo/mandate/{agent}/revoke")
+    def revoke_mandate(agent: str):
+        """Withdraw an agent's authority immediately -- the kill switch.
+
+        A MERCHANT action, like setting the cap: the mandate is the merchant's
+        statement of what an agent may spend, so withdrawing it is theirs to
+        do. The agent has no route to this and cannot reinstate itself.
+
+        Revocation is not deletion. The row stays with `revoked_at` set, so the
+        record of what was permitted, and when it stopped being permitted,
+        survives -- the same reason the audit log is append-only. What changes
+        is that `active_for_agent()` stops returning it, so the very next
+        request is denied with NO_ACTIVE_MANDATE rather than being evaluated
+        against a mandate nobody stands behind any more.
+        """
+        current = engine.mandates.active_for_agent(agent)
+        if current is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"reason": f"no active mandate for '{agent}' to revoke"})
+
+        engine.mandates.revoke(current.mandate_id)
+        return {
+            "agent_id": agent,
+            "revoked_mandate_id": current.mandate_id,
+            "was_max_amount_paise": current.max_amount_paise,
+            "note": "the next request from this agent is denied before its "
+                    "mandate rules are evaluated",
+        }
 
     @demo.post("/demo/catalog")
     def add_item(body: NewItem):
@@ -574,8 +608,16 @@ def create_demo_app(
                 "idempotency_key": next(
                     (e.idempotency_key for e in entries if e.idempotency_key),
                     None),
-                "sku": first.details.get("sku"),
-                "amount_paise": first.details.get("amount_paise"),
+                "sku": first_detail(entries, "sku"),
+                # PURCHASE_REQUESTED records this as `displayed_amount_paise`;
+                # reading only `amount_paise` off the opening event meant every
+                # row reported no amount at all.
+                "amount_paise": first_detail(entries, "amount_paise",
+                                             "displayed_amount_paise"),
+                "quantity": first_detail(entries, "quantity"),
+                # Read back from the logged provider response so a receipt
+                # opened after a reload can still show the order.
+                "order_id": provider_order_id(entries),
                 "started_at": first.occurred_at,
                 "updated_at": entries[-1].occurred_at,
                 "rule": verdict.rule if verdict else None,
@@ -719,6 +761,28 @@ def create_demo_app(
                             checkout.server_identity.public_key_b64[:12] + "…"
                             if checkout.server_identity else None
                         ),
+                    },
+                },
+                {
+                    "id": "instant_revocation",
+                    "title": "Authority can be withdrawn instantly",
+                    "mechanism": "Revoking a mandate takes effect on the next request, including one already awaiting confirmation",
+                    # Worth stating because "we can revoke" is a weaker claim
+                    # than it sounds: what matters is WHEN it takes effect. A
+                    # revocation that only applied to future drafts would leave
+                    # every pending request still spendable.
+                    "boundary": (
+                        "Stops future authorisation. It cannot claw back a "
+                        "payment that has already executed -- an order already "
+                        "placed with Razorpay stays placed, and reversing it is "
+                        "a refund, which this system does not implement"
+                    ),
+                    "evidence": {
+                        "revocable_now": engine.mandates.active_for_agent(
+                            agent_id) is not None,
+                        "mandates_revoked": engine.mandates.revoked_count(),
+                        "denial_rule": "NO_ACTIVE_MANDATE",
+                        "revoked_records_deleted": False,
                     },
                 },
             ],

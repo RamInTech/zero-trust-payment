@@ -180,6 +180,23 @@ class MandateStore:
             conn.close()
         return _row_to_mandate(row) if row else None
 
+    def revoked_count(self) -> int:
+        """How many mandates have been revoked. Read-only.
+
+        Exists so the reference client can show revocation as a live number
+        rather than a claim that revocation is possible. Revoked mandates are
+        never deleted -- the row stays, with `revoked_at` set -- so this also
+        stands as evidence that withdrawing authority is recorded rather than
+        erased.
+        """
+        conn = self._connect()
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) AS n FROM mandates WHERE revoked_at IS NOT NULL"
+            ).fetchone()["n"]
+        finally:
+            conn.close()
+
 
 def _row_to_mandate(row: sqlite3.Row) -> Mandate:
     return Mandate(
