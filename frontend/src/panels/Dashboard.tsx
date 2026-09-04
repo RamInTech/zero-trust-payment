@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button"
 import { api } from "@/api"
 import { Badge } from "@/components/ui/badge"
 import { Row, Rows, Stat } from "@/components/ui/rows"
+import { AnimatedNumber } from "@/components/AnimatedNumber"
 import { VelocityDots } from "@/components/VelocityDots"
 import { ActorTag } from "@/components/ActorTag"
 import { rupees } from "@/lib/utils"
@@ -35,17 +36,21 @@ export function Dashboard({
       <Card>
         <div className="grid divide-y divide-border sm:grid-cols-2 sm:divide-y-0 lg:grid-cols-4 lg:divide-x">
           <div className="px-5 py-4">
-            <Stat label="Purchases executed" value={stats?.purchases ?? 0} />
+            <Stat label="Purchases executed"
+                  value={<AnimatedNumber value={stats?.purchases ?? 0} />} />
           </div>
           <div className="px-5 py-4">
-            <Stat label="Total spend" value={rupees(stats?.spend_paise ?? 0)} />
+            <Stat label="Total spend"
+                  value={<AnimatedNumber value={stats?.spend_paise ?? 0} format={rupees} />} />
           </div>
           <div className="px-5 py-4">
-            <Stat label="Replays served" value={stats?.replays ?? 0}
+            <Stat label="Replays served"
+                  value={<AnimatedNumber value={stats?.replays ?? 0} />}
                   hint="charged once, answered twice" />
           </div>
           <div className="px-5 py-4">
-            <Stat label="Awaiting verification" value={pending}
+            <Stat label="Awaiting verification"
+                  value={<AnimatedNumber value={pending} />}
                   hint={pending > 0 ? "outcome unknown" : "none outstanding"} />
           </div>
         </div>
@@ -144,12 +149,12 @@ export function Dashboard({
               <p className="text-sm text-muted-foreground">No decisions yet.</p>
             </CardContent>
           ) : (
-            <table className="w-full text-left">
+            <table className="w-full table-fixed text-left">
               <thead>
                 <tr className="border-b border-border">
-                  <th className="label px-5 py-2 font-medium">Time</th>
-                  <th className="label px-5 py-2 font-medium">Outcome</th>
-                  <th className="label px-5 py-2 font-medium">Decided by</th>
+                  <th className="label w-[92px] px-5 py-2 font-medium">Time</th>
+                  <th className="label w-[168px] px-5 py-2 font-medium">Outcome</th>
+                  <th className="label w-[140px] px-5 py-2 font-medium">Decided by</th>
                   <th className="label px-5 py-2 font-medium">Reason</th>
                 </tr>
               </thead>
@@ -165,7 +170,7 @@ export function Dashboard({
                       </Badge>
                     </td>
                     <td className="px-5 py-2"><ActorTag actor={e.actor} /></td>
-                    <td className="max-w-0 truncate px-5 py-2 text-xs text-muted-foreground">
+                    <td className="truncate px-5 py-2 text-xs text-muted-foreground">
                       {e.reason}
                     </td>
                   </tr>

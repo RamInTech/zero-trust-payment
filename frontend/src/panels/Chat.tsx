@@ -1,11 +1,16 @@
 import { useEffect, useRef, useState } from "react"
-import { Bot, Check, KeyRound, Lock, Send, X } from "lucide-react"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { AnimatePresence, motion } from "framer-motion"
+import {
+  Bot, Check, ChevronDown, KeyRound, Lock, Minus, Plus, Send, ShieldCheck, X,
+} from "lucide-react"
+import { Card, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { api, type DemoConfig, type Json, type Pending } from "@/api"
 import { LifecycleTracker } from "@/components/LifecycleTracker"
-import { cn, rupees } from "@/lib/utils"
+import { PaymentProgress } from "@/components/PaymentProgress"
+import { Receipt, type ReceiptData } from "@/components/Receipt"
+import { EASE, cn, rupees } from "@/lib/utils"
 
 /**
  * A conversational surface over the real intent → confirm → policy flow.
@@ -24,7 +29,10 @@ export type Message =
   | { id: number; kind: "draft"; pending: Pending }
   | { id: number; kind: "basket"; lines: Pending[]; totalPaise: number }
   | { id: number; kind: "verdict"; body: Json; declined?: boolean }
+  | { id: number; kind: "receipt"; data: ReceiptData }
   | { id: number; kind: "stock-offer"; request: string }
+  | { id: number; kind: "suggestion"; sku: string; name: string
+      pricePaise: number; reason: string }
 
 /** Omit does not distribute over a union; this does. */
 type NewMessage<T = Message> = T extends any ? Omit<T, "id"> : never
@@ -44,13 +52,17 @@ const SUGGESTIONS = [
  * by glancing at the dashboard. Lifting it up is the fix; the alternative
  * (keeping every tab mounted forever) costs more and hides the reason.
  */
-export function Chat({ agent, config, onChanged, messages, setMessages }: {
+export function Chat({ agent, config, onChanged, messages, setMessages, transactions }: {
   agent: string; config: DemoConfig | null; onChanged: () => void
   messages: Message[]
   setMessages: React.Dispatch<React.SetStateAction<Message[]>>
+  transactions: Json[]
 }) {
   const [text, setText] = useState("")
   const [thinking, setThinking] = useState(false)
+  // The request currently being authorised, so the pipeline can be shown while
+  // the confirm call is in flight.
+  const [confirming, setConfirming] = useState<string | null>(null)
   const [e2e, setE2e] = useState(false)
   // Nudges the tracker to re-read immediately after an action, instead of
   // waiting out its poll interval.
@@ -137,13 +149,61 @@ export function Chat({ agent, config, onChanged, messages, setMessages }: {
 
   async function confirm(pending: Pending) {
     setThinking(true)
+    setConfirming(pending.request_id)
     const res = await api.confirm(pending.request_id)
+    setConfirming(null)
     setThinking(false)
     if (res.status === 409 || res.status === 410 || res.status === 404 || res.status === 503) {
       push({ kind: "verdict", body: { rejected: true, ...res.body.detail } })
     } else {
       push({ kind: "verdict", body: res.body })
+      if (res.body.approved) {
+        push({
+          kind: "receipt",
+          data: {
+            request_id: pending.request_id,
+            idempotency_key: pending.idempotency_key,
+            sku: pending.sku,
+            item_name: pending.item_name,
+            quantity: pending.quantity,
+            amount_paise: pending.displayed_amount_paise,
+            order_id: res.body.response?.order_id,
+            outcome: res.body.idempotency_outcome ?? "—",
+            executed: !!res.body.executed,
+            issued_at: Date.now(),
+            agent_id: pending.agent_id ?? agent,
+          },
+        })
+      }
     }
+    onChanged(); bump()
+  }
+
+  /**
+   * Re-propose the same item at a different quantity.
+   *
+   * The amount is never recomputed here -- a new draft is requested from the
+   * server so the price still comes from the catalog. Multiplying the displayed
+   * amount in the browser would put the client in charge of a number the
+   * confirm step is supposed to re-derive independently.
+   */
+  async function changeQuantity(pending: Pending, quantity: number) {
+    if (quantity < 1 || quantity === pending.quantity || thinking) return
+    setThinking(true)
+    // The superseded draft is declined rather than abandoned, so it reaches a
+    // terminal state in the audit log instead of sitting pending forever.
+    await api.decline(pending.request_id)
+    const res = await api.intentFromSku(agent, pending.sku, quantity)
+    if (res.ok) {
+      const next: Pending = res.body.awaiting_confirmation
+      const keyed = await api.pending(next.request_id)
+      if (keyed.ok) next.idempotency_key = keyed.body.idempotency_key
+      setMessages(prev => prev.map(m =>
+        m.kind === "draft" && m.pending.request_id === pending.request_id
+          ? { ...m, pending: next }
+          : m))
+    }
+    setThinking(false)
     onChanged(); bump()
   }
 
@@ -154,7 +214,7 @@ export function Chat({ agent, config, onChanged, messages, setMessages }: {
   }
 
   return (
-    <div className="grid gap-4 lg:grid-cols-[240px_1fr_300px]">
+    <div className="grid gap-4 lg:grid-cols-[260px_1fr]">
       {/* Left rail: what each transaction is actually doing right now. */}
       <Card className="order-2 flex h-[calc(100vh-11rem)] min-h-[520px] flex-col overflow-hidden lg:order-1">
         <CardHeader>
@@ -199,7 +259,12 @@ export function Chat({ agent, config, onChanged, messages, setMessages }: {
           aria-label="Conversation with the shopping agent"
         >
           {messages.map(m => (
-            <div key={m.id}>
+            <motion.div
+              key={m.id}
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.22, ease: EASE }}
+            >
               {m.kind === "customer" && (
                 <div className="flex justify-end">
                   <p className="w-fit max-w-[76%] rounded-lg rounded-br-sm bg-primary px-3 py-2 text-sm text-primary-foreground">
@@ -223,7 +288,9 @@ export function Chat({ agent, config, onChanged, messages, setMessages }: {
               )}
 
               {m.kind === "draft" && (
-                <DraftCard pending={m.pending} onConfirm={confirm} onDecline={decline} />
+                <DraftCard pending={m.pending} transactions={transactions}
+                           onConfirm={confirm} onDecline={decline}
+                           onQuantity={changeQuantity} busy={thinking} />
               )}
 
               {m.kind === "basket" && (
@@ -233,16 +300,39 @@ export function Chat({ agent, config, onChanged, messages, setMessages }: {
 
               {m.kind === "verdict" && <Verdict body={m.body} declined={m.declined} />}
 
+              {m.kind === "receipt" && (
+                <div className="max-w-[86%]"><Receipt data={m.data} /></div>
+              )}
+
+              {m.kind === "suggestion" && (
+                <SuggestionCard
+                  sku={m.sku} name={m.name} pricePaise={m.pricePaise}
+                  reason={m.reason}
+                  onAccept={async () => {
+                    const drafted = await api.intentFromSku(agent, m.sku)
+                    if (!drafted.ok) return
+                    const p = drafted.body.awaiting_confirmation
+                    const keyed = await api.pending(p.request_id)
+                    if (keyed.ok) p.idempotency_key = keyed.body.idempotency_key
+                    push({ kind: "draft", pending: p })
+                  }}
+                />
+              )}
+
               {m.kind === "stock-offer" && (
                 <StockOffer request={m.request} onStocked={sku => {
                   onChanged()
                   send(`buy the ${sku}`)
                 }} />
               )}
-            </div>
+            </motion.div>
           ))}
 
-          {thinking && (
+          {messages.length <= 1 && !thinking && <OpeningState e2e={e2e} />}
+
+          {confirming && <PaymentProgress requestId={confirming} />}
+
+          {thinking && !confirming && (
             <p className="text-xs text-faint">
               Parsing with {config?.parser ?? "the agent"}…
             </p>
@@ -276,48 +366,203 @@ export function Chat({ agent, config, onChanged, messages, setMessages }: {
         </div>
       </Card>
 
-      <Card className="order-3 h-fit lg:order-3">
-        <CardHeader><CardTitle>Agent permissions</CardTitle></CardHeader>
-        <CardContent className="grid gap-4">
-          <ul className="grid gap-2">
-            {[
-              ["Can", "Name a catalog item"],
-              ["Can", "Ask for clarification"],
-              ["Cannot", "Set a price"],
-              ["Cannot", "Approve a purchase"],
-              ["Cannot", "Write to the audit log"],
-            ].map(([verb, what], i) => (
-              <li key={i} className="flex items-baseline gap-2 text-xs">
-                <span className={cn("w-12 shrink-0 font-medium",
-                  verb === "Can" ? "text-ok" : "text-danger")}>{verb}</span>
-                <span className="text-muted-foreground">{what}</span>
-              </li>
-            ))}
-          </ul>
-          {config && !config.conversational && (
-            <p className="border-t border-border pt-3 text-2xs leading-relaxed text-muted-foreground">
-              Replies are built from system state, not generated. The intent
-              layer parses; it does not converse.
-            </p>
-          )}
-        </CardContent>
-      </Card>
+      <div className="order-3 lg:col-span-2">
+        <AgentPermissions config={config} />
+      </div>
     </div>
   )
 }
 
-function DraftCard({ pending, onConfirm, onDecline }: {
+/**
+ * Shown until the first real exchange, in place of an empty scroll region.
+ *
+ * Every line names a mechanism that exists and is exercised elsewhere in this
+ * UI -- the encryption row appears only when the server actually offers a
+ * public key. A reassurance panel listing protections the system does not have
+ * would be exactly the theatre the Security page exists to argue against.
+ */
+function OpeningState({ e2e }: { e2e: boolean }) {
+  const points = [
+    e2e && ["Encrypted in your browser", "The server stores ciphertext, never your words."],
+    ["The agent only proposes", "Nothing is authorised until you confirm it."],
+    ["Re-checked at confirm time", "The price and the mandate are read again, not trusted."],
+    ["Charged exactly once", "A retry replays the first result instead of paying twice."],
+  ].filter(Boolean) as [string, string][]
+
+  return (
+    <div className="pt-6">
+      <ul className="grid max-w-md gap-3">
+        {points.map(([title, body], i) => (
+          <motion.li
+            key={title}
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.32, delay: 0.06 * i, ease: EASE }}
+            className="flex gap-2.5"
+          >
+            <ShieldCheck className="mt-px h-3.5 w-3.5 shrink-0 text-ok" aria-hidden="true" />
+            <span className="text-xs leading-relaxed">
+              <span className="font-medium text-foreground">{title}.</span>{" "}
+              <span className="text-muted-foreground">{body}</span>
+            </span>
+          </motion.li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
+const PERMISSIONS: [string, string][] = [
+  ["Can", "Name a catalog item"],
+  ["Can", "Ask for clarification"],
+  ["Cannot", "Set a price"],
+  ["Cannot", "Approve a purchase"],
+  ["Cannot", "Write to the audit log"],
+]
+
+/**
+ * The trust boundary, stated once and out of the way.
+ *
+ * This used to be a full-height column beside the conversation, which gave a
+ * five-line static list the same visual weight as the thing the page is for.
+ * Collapsed by default: the summary line carries the whole point, and the
+ * detail is one click away for anyone who wants it.
+ */
+function AgentPermissions({ config }: { config: DemoConfig | null }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <div className="surface overflow-hidden rounded-lg">
+      <button
+        onClick={() => setOpen(o => !o)}
+        aria-expanded={open}
+        className="flex w-full items-center gap-2.5 px-4 py-2.5 text-left transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+      >
+        <ShieldCheck className="h-4 w-4 shrink-0 text-faint" aria-hidden="true" />
+        <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+          <span className="font-medium text-foreground">Agent permissions</span>
+          {" — it can propose a purchase, it cannot approve one."}
+        </span>
+        <ChevronDown
+          className={cn("h-4 w-4 shrink-0 text-faint transition-transform duration-200",
+                        open && "rotate-180")}
+          aria-hidden="true"
+        />
+      </button>
+
+      <AnimatePresence initial={false}>
+        {open && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.24, ease: EASE }}
+            className="overflow-hidden"
+          >
+            <div className="border-t border-border px-4 py-3">
+              <ul className="grid gap-2 sm:grid-cols-3">
+                {PERMISSIONS.map(([verb, what]) => (
+                  <li key={what} className="flex items-baseline gap-2 text-xs">
+                    <span className={cn("w-12 shrink-0 font-medium",
+                      verb === "Can" ? "text-ok" : "text-danger")}>{verb}</span>
+                    <span className="text-muted-foreground">{what}</span>
+                  </li>
+                ))}
+              </ul>
+              {config && !config.conversational && (
+                <p className="mt-3 border-t border-border pt-2.5 text-2xs leading-relaxed text-muted-foreground">
+                  Replies are built from system state, not generated. The intent
+                  layer parses; it does not converse.
+                </p>
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  )
+}
+
+/**
+ * A purchase of the same item, at the same amount, that already went through
+ * recently.
+ *
+ * This is the one double-charge the idempotency key cannot catch: keys are
+ * minted per intent, so an agent that gives up on a request and proposes a
+ * fresh one gets a new key and a second real charge. Deduplicating on the
+ * server would also block a genuine "buy another one now", so the guard is a
+ * warning to the human who is about to confirm -- the only party that can tell
+ * the two apart.
+ */
+const DUPLICATE_WINDOW_MS = 10 * 60 * 1000
+
+function recentDuplicate(pending: Pending, transactions: Json[]): Json | undefined {
+  const now = Date.now()
+  return transactions.find(t =>
+    t.sku === pending.sku &&
+    t.amount_paise === pending.displayed_amount_paise &&
+    t.request_id !== pending.request_id &&
+    (t.status === "COMPLETED" || t.status === "APPROVED") &&
+    now - t.updated_at * 1000 < DUPLICATE_WINDOW_MS)
+}
+
+function DraftCard({ pending, transactions, onConfirm, onDecline, onQuantity, busy }: {
   pending: Pending
+  transactions: Json[]
   onConfirm: (p: Pending) => void
   onDecline: (p: Pending) => void
+  onQuantity: (p: Pending, quantity: number) => void
+  busy: boolean
 }) {
   const [done, setDone] = useState(false)
+  const duplicate = recentDuplicate(pending, transactions)
+  const minutesAgo = duplicate
+    ? Math.max(1, Math.round((Date.now() - duplicate.updated_at * 1000) / 60000))
+    : 0
+
   return (
     <div className="max-w-[86%] rounded-lg border border-border bg-card p-4">
       <div className="flex items-center justify-between gap-3">
         <p className="text-md font-semibold text-foreground">{pending.prompt}</p>
         <Badge variant="warn">Proposed</Badge>
       </div>
+
+      {!done && (
+        <div className="mt-3 flex items-center justify-between gap-4 border-t border-border pt-2.5">
+          <span className="text-xs text-muted-foreground">Quantity</span>
+          <span className="flex items-center gap-1">
+            <button
+              onClick={() => onQuantity(pending, pending.quantity - 1)}
+              disabled={busy || pending.quantity <= 1}
+              aria-label="Decrease quantity"
+              className="grid h-6 w-6 place-items-center rounded border border-border text-muted-foreground transition-colors hover:bg-muted disabled:opacity-40"
+            >
+              <Minus className="h-3 w-3" aria-hidden="true" />
+            </button>
+            <span className="mono w-7 text-center tabular-nums text-foreground"
+                  aria-live="polite">
+              {pending.quantity}
+            </span>
+            <button
+              onClick={() => onQuantity(pending, pending.quantity + 1)}
+              disabled={busy}
+              aria-label="Increase quantity"
+              className="grid h-6 w-6 place-items-center rounded border border-border text-muted-foreground transition-colors hover:bg-muted disabled:opacity-40"
+            >
+              <Plus className="h-3 w-3" aria-hidden="true" />
+            </button>
+          </span>
+        </div>
+      )}
+
+      {duplicate && !done && (
+        <p className="mt-3 rounded-r border-l-2 border-l-warn bg-warn/[0.06] px-3 py-2 text-xs text-muted-foreground">
+          <span className="font-medium text-warn">Possible repeat.</span>{" "}
+          You bought this same item for the same amount {minutesAgo} minute
+          {minutesAgo === 1 ? "" : "s"} ago. Confirming charges again — the
+          idempotency key only stops a retry of one request, not a second one.
+        </p>
+      )}
+
       <dl className="mt-3 border-t border-border pt-2.5">
         <div className="flex items-baseline justify-between gap-4 py-1">
           <dt className="text-xs text-muted-foreground">Amount</dt>
@@ -561,6 +806,53 @@ function BasketCard({ lines, totalPaise, onConfirm, onDecline }: {
             Sends each one separately. Any line can still be refused on its own.
           </p>
         </div>
+      )}
+    </div>
+  )
+}
+
+
+/**
+ * A merchant's add-on suggestion.
+ *
+ * Accepting it does NOT buy anything -- it drafts an ordinary pending purchase
+ * that then needs the same confirmation and the same policy check as a request
+ * the customer typed themselves. That indirection is the point: the upsell path
+ * gets no shortcut, so a suggested item over the mandate's cap is refused just
+ * as the customer's own request would be.
+ */
+function SuggestionCard({ sku, name, pricePaise, reason, onAccept }: {
+  sku: string; name: string; pricePaise: number; reason: string
+  onAccept: () => void
+}) {
+  const [taken, setTaken] = useState(false)
+  const [dismissed, setDismissed] = useState(false)
+  if (dismissed) return null
+
+  return (
+    <div className="max-w-[76%] rounded-lg border border-dashed border-border bg-card p-3">
+      <p className="text-2xs uppercase tracking-wide text-faint">Also available</p>
+      <div className="mt-1 flex items-baseline justify-between gap-3">
+        <p className="text-sm font-medium text-foreground">{name}</p>
+        <p className="text-sm tabular-nums text-muted-foreground">{rupees(pricePaise)}</p>
+      </div>
+      <p className="mt-0.5 text-xs text-muted-foreground">{reason}</p>
+      <p className="mono mt-0.5 text-2xs text-faint">{sku}</p>
+
+      {!taken ? (
+        <div className="mt-2.5 flex gap-2">
+          <Button size="sm" onClick={() => { setTaken(true); onAccept() }}>
+            Add it
+          </Button>
+          <Button size="sm" variant="outline" onClick={() => setDismissed(true)}>
+            No thanks
+          </Button>
+        </div>
+      ) : (
+        <p className="mt-2 text-2xs text-faint">
+          Drafted below — it still needs your confirmation, and still faces the
+          mandate.
+        </p>
       )}
     </div>
   )

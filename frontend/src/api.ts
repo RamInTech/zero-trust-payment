@@ -73,11 +73,22 @@ export const api = {
 
   intentFromText: (agent_id: string, text: string) => post("/api/intents", { agent_id, text }),
   e2ePublicKey: () => call("/api/e2e/public-key"),
+  recommendations: (sku: string, limit = 1) =>
+    call(`/api/recommendations/${sku}?limit=${limit}`),
   intentFromTextSealed: async (agent_id: string, text: string) => {
     const key = await call("/api/e2e/public-key")
     if (!key.ok) return key
     const sealed = seal(text, key.body.public_key_b64)
     return post("/api/intents", { agent_id, sealed })
+  },
+  /** Same call, but also returns the ciphertext that was actually sent --
+   * for demonstrations that need to SHOW the bytes, not just use them. */
+  intentFromTextSealedInspect: async (agent_id: string, text: string) => {
+    const key = await call("/api/e2e/public-key")
+    if (!key.ok) return { res: key, sealed: null }
+    const sealed = seal(text, key.body.public_key_b64)
+    const res = await post("/api/intents", { agent_id, sealed })
+    return { res, sealed }
   },
   intentFromSku: (agent_id: string, sku: string, quantity = 1) =>
     post("/api/purchase-intents", { agent_id, sku, quantity }),
@@ -86,6 +97,7 @@ export const api = {
   decline: (requestId: string) => post(`/api/intents/${requestId}/decline`),
 
   freshAgent: () => post("/demo/agent"),
+  revokeMandate: (agent: string) => post(`/demo/mandate/${agent}/revoke`),
   setCap: (agent: string, max_amount_paise: number) =>
     post(`/demo/mandate/${agent}/cap`, { max_amount_paise }),
   addItem: (sku: string, name: string, price_paise: number) =>

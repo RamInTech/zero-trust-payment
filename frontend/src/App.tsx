@@ -1,16 +1,18 @@
 import { useCallback, useEffect, useState } from "react"
+import { MotionConfig, motion } from "framer-motion"
 import {
-  LayoutDashboard, MessagesSquare, Receipt, ShieldCheck, ShoppingCart,
+  LayoutDashboard, MessagesSquare, PanelLeftClose, PanelLeftOpen, Receipt,
+  ShieldCheck, ShoppingCart,
 } from "lucide-react"
 import { Tabs, TabsContent } from "@/components/ui/tabs"
-import { TooltipProvider } from "@/components/ui/tooltip"
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { Dashboard } from "@/panels/Dashboard"
 import { Chat, type Message } from "@/panels/Chat"
 import { Checkout } from "@/panels/Checkout"
 import { Transactions } from "@/panels/Transactions"
 import { SecurityHub } from "@/panels/SecurityHub"
 import { api, type DemoConfig, type Json } from "@/api"
-import { cn } from "@/lib/utils"
+import { EASE, cn } from "@/lib/utils"
 
 const NAV = [
   {
@@ -35,7 +37,15 @@ const NAV = [
   },
 ]
 
+const SIDEBAR_WIDE = 232
+const SIDEBAR_NARROW = 64
+
 export default function App() {
+  const [collapsed, setCollapsed] = useState(() => {
+    // Remembered per browser; a viewer who collapsed it should not have to
+    // collapse it again on every visit.
+    try { return localStorage.getItem("sidebar-collapsed") === "1" } catch { return false }
+  })
   const [agent, setAgent] = useState("agent_alpha")
   const [catalog, setCatalog] = useState<Json[]>([])
   const [mandate, setMandate] = useState<Json | null>(null)
@@ -80,9 +90,18 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  useEffect(() => {
+    try { localStorage.setItem("sidebar-collapsed", collapsed ? "1" : "0") } catch { /* storage may be blocked */ }
+  }, [collapsed])
+
   const current = NAV.find(n => n.value === tab)
 
   return (
+    // Framer Motion does not consult prefers-reduced-motion on its own; without
+    // this every transition below would play regardless of the OS setting. The
+    // CSS media block in index.css only reaches CSS transitions, not JS-driven
+    // ones, so the two together are what actually honour the preference.
+    <MotionConfig reducedMotion="user">
     <TooltipProvider delayDuration={200}>
       <a href="#main"
          className="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-4 focus:z-50 focus:rounded-md focus:bg-primary focus:px-4 focus:py-2 focus:text-primary-foreground">
@@ -90,49 +109,98 @@ export default function App() {
       </a>
 
       <div className="flex min-h-screen">
-        <aside className="hidden w-[232px] shrink-0 flex-col border-r border-border bg-card md:flex">
-          <div className="flex items-center gap-2.5 px-5 py-5">
-            <span className="grid h-7 w-7 place-items-center rounded-md bg-navy" aria-hidden="true">
+        <motion.aside
+          initial={false}
+          animate={{ width: collapsed ? SIDEBAR_NARROW : SIDEBAR_WIDE }}
+          transition={{ duration: 0.28, ease: EASE }}
+          className="sticky top-0 hidden h-screen shrink-0 flex-col overflow-hidden whitespace-nowrap border-r border-border bg-card md:flex"
+        >
+          <div className={cn("flex items-center gap-2.5 py-5",
+                             collapsed ? "justify-center px-0" : "px-5")}>
+            <span className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-navy" aria-hidden="true">
               <ShieldCheck className="h-4 w-4 text-white" />
             </span>
-            <span className="text-sm font-semibold leading-tight text-foreground">
-              Zero-Trust
-              <span className="block text-2xs font-normal text-muted-foreground">
-                Payment Authorization
+            {!collapsed && (
+              <span className="min-w-0 text-sm font-semibold leading-tight text-foreground">
+                Zero-Trust
+                <span className="block truncate text-2xs font-normal text-muted-foreground">
+                  Payment Authorization
+                </span>
               </span>
-            </span>
+            )}
           </div>
 
-          <nav className="flex-1 px-3" aria-label="Sections">
+          <nav className={cn("flex-1", collapsed ? "px-2" : "px-3")} aria-label="Sections">
             <ul className="grid gap-px">
-              {NAV.map(({ value, label, Icon }) => (
-                <li key={value}>
+              {NAV.map(({ value, label, Icon }) => {
+                const active = tab === value
+                const button = (
                   <button
                     onClick={() => setTab(value)}
-                    aria-current={tab === value ? "page" : undefined}
+                    aria-current={active ? "page" : undefined}
                     className={cn(
-                      "flex w-full items-center gap-2.5 rounded-md px-2.5 py-[7px] text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                      tab === value
-                        ? "bg-muted font-medium text-foreground"
+                      "relative flex w-full items-center gap-2.5 rounded-md py-[7px] text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                      collapsed ? "justify-center px-0" : "px-2.5",
+                      active
+                        ? "font-medium text-foreground"
                         : "text-muted-foreground hover:bg-muted/60 hover:text-foreground"
                     )}
                   >
+                    {/* The selected ground slides between items rather than
+                        blinking out of one and into the next. */}
+                    {active && (
+                      <motion.span
+                        layoutId="nav-active"
+                        transition={{ duration: 0.24, ease: EASE }}
+                        className="absolute inset-0 -z-10 rounded-md bg-muted"
+                        aria-hidden="true"
+                      />
+                    )}
                     <Icon
-                      className={cn("h-4 w-4", tab === value ? "text-primary" : "text-faint")}
+                      className={cn("h-4 w-4 shrink-0", active ? "text-primary" : "text-faint")}
                       aria-hidden="true"
                     />
-                    {label}
+                    {!collapsed && <span className="truncate">{label}</span>}
                   </button>
-                </li>
-              ))}
+                )
+                return (
+                  <li key={value}>
+                    {collapsed ? (
+                      <Tooltip>
+                        <TooltipTrigger asChild>{button}</TooltipTrigger>
+                        <TooltipContent side="right">{label}</TooltipContent>
+                      </Tooltip>
+                    ) : button}
+                  </li>
+                )
+              })}
             </ul>
           </nav>
 
-          <div className="px-5 py-5 text-2xs leading-relaxed text-faint">
-            Built on Razorpay test mode. Not an official Razorpay product.
-            Capture is simulated.
+          {!collapsed && (
+            <p className="whitespace-normal px-5 pb-4 text-2xs leading-relaxed text-faint">
+              Built on Razorpay test mode. Not an official Razorpay product.
+              Capture is simulated.
+            </p>
+          )}
+
+          <div className={cn("border-t border-border py-2", collapsed ? "px-2" : "px-3")}>
+            <button
+              onClick={() => setCollapsed(c => !c)}
+              aria-expanded={!collapsed}
+              aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+              className={cn(
+                "flex w-full items-center gap-2.5 rounded-md py-[7px] text-xs text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                collapsed ? "justify-center px-0" : "px-2.5"
+              )}
+            >
+              {collapsed
+                ? <PanelLeftOpen className="h-4 w-4 shrink-0" aria-hidden="true" />
+                : <PanelLeftClose className="h-4 w-4 shrink-0" aria-hidden="true" />}
+              {!collapsed && "Collapse"}
+            </button>
           </div>
-        </aside>
+        </motion.aside>
 
         <div className="flex min-w-0 flex-1 flex-col">
           <header className="sticky top-0 z-20 border-b border-border bg-card/95 backdrop-blur">
@@ -182,11 +250,18 @@ export default function App() {
           </header>
 
           <main id="main" className="flex-1">
-            <div className="mx-auto max-w-[1180px] px-6 py-6">
+            <motion.div
+              key={tab}
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.22, ease: EASE }}
+              className="mx-auto max-w-[1180px] px-6 py-6"
+            >
               <Tabs value={tab} onValueChange={setTab}>
                 <TabsContent value="chat" className="focus-visible:outline-none">
                   <Chat agent={agent} config={config} onChanged={() => refresh()}
-                        messages={messages} setMessages={setMessages} />
+                        messages={messages} setMessages={setMessages}
+                        transactions={transactions} />
                 </TabsContent>
                 <TabsContent value="dashboard" className="focus-visible:outline-none">
                   <Dashboard mandate={mandate} stats={stats} audit={audit} sweep={sweep}
@@ -196,17 +271,18 @@ export default function App() {
                   <Checkout agent={agent} catalog={catalog} onChanged={() => refresh()} />
                 </TabsContent>
                 <TabsContent value="transactions" className="focus-visible:outline-none">
-                  <Transactions transactions={transactions} />
+                  <Transactions transactions={transactions} catalog={catalog} />
                 </TabsContent>
                 <TabsContent value="hub" className="focus-visible:outline-none">
                   <SecurityHub agent={agent} layers={layers} adversarial={adversarial}
                                onChanged={() => refresh()} />
                 </TabsContent>
               </Tabs>
-            </div>
+            </motion.div>
           </main>
         </div>
       </div>
     </TooltipProvider>
+    </MotionConfig>
   )
 }
