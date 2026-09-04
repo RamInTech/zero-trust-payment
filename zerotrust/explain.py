@@ -56,6 +56,48 @@ class Explanation:
         }
 
 
+def first_detail(entries: list[AuditEntry], *keys: str):
+    """First non-null value for any of `keys`, scanned across the whole trail.
+
+    Reading a request's shape off `entries[0]` alone is fragile: which event
+    comes first depends on how the purchase was started. A chat purchase now
+    opens with INTENT_PARSED, which carries the SKU but no amount, so anything
+    keyed off the opening event silently reported no amount at all. The facts
+    belong to the request, not to whichever event happens to lead it.
+    """
+    for entry in entries:
+        for key in keys:
+            value = entry.details.get(key)
+            if value is not None:
+                return value
+    return None
+
+
+def provider_order_id(entries: list[AuditEntry]) -> Optional[str]:
+    """The provider's order id, dug out of the logged provider response.
+
+    `PAYMENT_CAPTURED` stores the whole response dict under `details["response"]`,
+    so the id is one level deeper than `first_detail` looks. It is read back from
+    the log rather than kept in memory so a receipt opened later -- after a
+    reload, from the transactions list -- can still show it.
+
+    Razorpay names this field `id`, and both `RazorpayTestModeProvider` and
+    `SimulatedProvider` return the order dict unchanged -- so `id` is the real
+    spelling and is checked first. `order_id` is accepted too, because the
+    capture path and some test doubles use that name.
+
+    Returns None for a REPLAYED request: no `PAYMENT_CAPTURED` is written for a
+    replay, because the charge belonged to the original request.
+    """
+    for entry in entries:
+        response = entry.details.get("response")
+        if isinstance(response, dict):
+            order_id = response.get("id") or response.get("order_id")
+            if order_id:
+                return order_id
+    return None
+
+
 def explain(
     audit: AuditLog,
     request_id: str,
@@ -78,9 +120,11 @@ def explain(
 
     what = {
         "agent_id": opening.agent_id,
-        "sku": opening.details.get("sku"),
-        "amount_paise": opening.details.get("amount_paise")
-        or opening.details.get("displayed_amount_paise"),
+        "sku": first_detail(entries, "sku"),
+        "amount_paise": first_detail(entries, "amount_paise",
+                                     "displayed_amount_paise"),
+        "quantity": first_detail(entries, "quantity"),
+        "order_id": provider_order_id(entries),
         "idempotency_key": next(
             (e.idempotency_key for e in entries if e.idempotency_key), None),
         "outcome": outcome,

@@ -4,6 +4,7 @@ import { Card, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Row, Rows } from "@/components/ui/rows"
 import { ActorTag } from "@/components/ActorTag"
+import { Receipt, type ReceiptData } from "@/components/Receipt"
 import { api, type Json } from "@/api"
 import { cn, rupees } from "@/lib/utils"
 
@@ -13,7 +14,33 @@ const TONE: Record<string, "ok" | "danger" | "warn" | "default" | "info"> = {
   PENDING_VERIFICATION: "warn", DECLINED: "default", IN_PROGRESS: "default",
 }
 
-export function Transactions({ transactions }: { transactions: Json[] }) {
+/**
+ * Rebuild a receipt from what the audit log says, not from what the browser
+ * happened to be holding.
+ *
+ * A receipt shown only in the chat thread vanished on reload, because the
+ * thread is React state. Reconstructing it from the server means the bill for
+ * any settled purchase is still there tomorrow.
+ */
+function receiptFrom(t: Json, what: Json | undefined, itemName: string): ReceiptData {
+  return {
+    request_id: t.request_id,
+    idempotency_key: t.idempotency_key ?? undefined,
+    sku: t.sku ?? "—",
+    item_name: itemName,
+    quantity: t.quantity ?? what?.quantity ?? 1,
+    amount_paise: t.amount_paise ?? what?.amount_paise ?? 0,
+    order_id: t.order_id ?? what?.order_id ?? undefined,
+    outcome: t.status,
+    executed: !!(what?.money_moved ?? t.status === "COMPLETED"),
+    issued_at: t.updated_at * 1000,
+    agent_id: t.agent_id,
+  }
+}
+
+export function Transactions({ transactions, catalog }: {
+  transactions: Json[]; catalog: Json[]
+}) {
   const [open, setOpen] = useState<string | null>(null)
   const [explained, setExplained] = useState<Record<string, Json>>({})
 
@@ -73,7 +100,19 @@ export function Transactions({ transactions }: { transactions: Json[] }) {
                     {!explained[t.request_id] ? (
                       <p className="text-xs text-muted-foreground">Loading…</p>
                     ) : (
-                      <Explanation data={explained[t.request_id]} />
+                      <>
+                        {t.status === "COMPLETED" && (
+                          <div className="mb-5 max-w-md">
+                            <Receipt
+                              data={receiptFrom(
+                                t, explained[t.request_id]?.what,
+                                catalog.find(c => c.sku === t.sku)?.name ?? t.sku ?? "Item")}
+                              compact
+                            />
+                          </div>
+                        )}
+                        <Explanation data={explained[t.request_id]} />
+                      </>
                     )}
                   </div>
                 )}
