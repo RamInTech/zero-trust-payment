@@ -12,14 +12,22 @@ would still look completely fine on screen, which is exactly the class of
 failure this project keeps writing journal entries about.
 
 The UI is a demonstration client for the API it mounts at /api. It holds no
-authorisation logic. DEMO ONLY: no authentication, and the audit view exposes
-mandate internals.
+authorisation logic. DEMO ONLY: there is still no authentication on the demo
+surface at large, and the audit view exposes mandate internals -- but editing
+a mandate (cap, allowlist, expiry, velocity, revoke) now requires an admin
+login. If ADMIN_USERNAME / ADMIN_PASSWORD_HASH are not set in the
+environment, one is generated for this run and PRINTED below, the same way a
+tool like Jenkins prints its first-run admin password -- so the demo stays
+usable with zero setup, without silently skipping the login it exists to
+enforce.
 """
 
 import os
+import secrets
 import sys
 import time
 
+import bcrypt
 import uvicorn
 from dotenv import load_dotenv
 
@@ -40,6 +48,9 @@ from zerotrust.policy import PolicyEngine
 from zerotrust.recommend import StaticRecommender
 from zerotrust.provider import ProviderTimeout, SimulatedProvider
 from zerotrust.reconcile import ReconciliationScheduler, Reconciler
+from zerotrust.admin_auth import AdminAuth
+from zerotrust.config import AdminConfig, admin_config_from_env, webhook_secret_from_env
+from zerotrust.webhook import WebhookReceiver
 
 HOUR = 3600.0
 AGENT = "agent_alpha"
@@ -50,6 +61,31 @@ def _receipt(request) -> str:
     """One receipt per idempotency key, so the sweep can find the order again."""
     return f"ui_{request.idempotency_key[:18]}"
 DBS = {"audit": "ui_audit.db", "policy": "ui_policy.db", "idem": "ui_idem.db"}
+
+
+def _admin_auth() -> AdminAuth:
+    """The admin login for mandate editing, configured or generated.
+
+    A missing `ADMIN_USERNAME` / `ADMIN_PASSWORD_HASH` does not fall back to
+    an unauthenticated admin -- that would silently defeat the login this
+    script exists to demonstrate. Instead a real, random password is
+    generated and hashed here, and printed once at startup so the developer
+    can actually use the mandate editor without having to configure anything
+    first. It never touches disk and is gone the moment this process exits.
+    """
+    configured = admin_config_from_env()
+    if configured is not None:
+        print(f"  Admin login: configured (ADMIN_USERNAME={configured.username!r})")
+        return AdminAuth(configured)
+
+    password = secrets.token_urlsafe(18)
+    password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode()
+    print("  Admin login: not configured -- generated for this run only:")
+    print("    username: admin")
+    print(f"    password: {password}")
+    print("    (set ADMIN_USERNAME / ADMIN_PASSWORD_HASH in .env to fix these)")
+    return AdminAuth(AdminConfig(username="admin", password_hash=password_hash,
+                                 session_secret=secrets.token_hex(32)))
 
 
 def build(force_simulated: bool = False):
@@ -170,8 +206,20 @@ def build(force_simulated: bool = False):
         interval_seconds=SWEEP_INTERVAL_SECONDS,
     ).start()
 
+    # A verified webhook sweeps NOW instead of waiting out the interval. That
+    # is the whole gain over polling, and it is deliberately the only thing a
+    # webhook can cause: the sweep asks the provider directly, so nothing the
+    # delivery claimed is taken on trust.
+    receiver = WebhookReceiver(
+        webhook_secret_from_env(),
+        audit=audit,
+        on_verified=lambda receipt: scheduler.run_once(),
+    )
+
     return create_demo_app(checkout, engine, audit, catalog, agent_id=AGENT,
                            faults=faults, scheduler=scheduler,
+                           webhooks=receiver,
+                           admin_auth=_admin_auth(),
                            narrator=narrator,
                            payments_mode="razorpay-test" if live else "simulated",
                            recommender=StaticRecommender(catalog))

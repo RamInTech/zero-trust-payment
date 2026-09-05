@@ -96,6 +96,34 @@ class Catalog:
                 description=item.description,
             )
 
+    def rename(self, sku: str, name: str) -> None:
+        """Change the display name -- the SKU itself never changes, since
+        that's what every reference to this item (allowlists, pending
+        purchases, the audit log) is keyed on."""
+        with self._lock:
+            item = self._items[sku]
+            self._items[sku] = CatalogItem(
+                sku=item.sku,
+                name=name,
+                price_paise=item.price_paise,
+                available=item.available,
+                description=item.description,
+            )
+
+    def remove(self, sku: str) -> None:
+        """Unstock an item entirely. A mandate's allowlist may still name it --
+        left alone deliberately, not cleaned up here -- so a purchase attempt
+        against it fails with `ITEM_NOT_IN_CATALOG`, a specific reason, rather
+        than this method reaching into mandate state it has no business
+        touching."""
+        with self._lock:
+            try:
+                del self._items[sku]
+            except KeyError:
+                raise ItemNotInCatalog(
+                    f"sku '{sku}' is not in the catalog"
+                ) from None
+
     def all(self) -> list[CatalogItem]:
         with self._lock:
             return sorted(self._items.values(), key=lambda i: i.sku)
@@ -145,8 +173,17 @@ def demo_catalog() -> Catalog:
                     description="Chilled cola, 500ml bottle"),
         CatalogItem("SKU-LEMONADE", "Lemon Soda", 4_000,
                     description="Sparkling lemon soda, 330ml can"),
-        CatalogItem("SKU-JUICE", "Orange Juice", 6_000,
+        # Three flavours on purpose: "buy a juice" naming no flavour cannot
+        # tell which of these is meant, so it must ask rather than default to
+        # whichever one happened to be added first. A single "Orange Juice"
+        # SKU made the request look unambiguous when the customer never said
+        # which juice they wanted.
+        CatalogItem("SKU-JUICE-ORANGE", "Orange Juice", 6_000,
                     description="No-sugar-added orange juice, 1L"),
+        CatalogItem("SKU-JUICE-APPLE", "Apple Juice", 6_000,
+                    description="No-sugar-added apple juice, 1L"),
+        CatalogItem("SKU-JUICE-MIXED", "Mixed Fruit Juice", 6_500,
+                    description="No-sugar-added mixed fruit juice, 1L"),
         CatalogItem("SKU-WATER", "Mineral Water", 2_000,
                     description="Packaged drinking water, 1L"),
 

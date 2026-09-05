@@ -7,6 +7,7 @@ import { Card, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { api, type DemoConfig, type Json, type Pending } from "@/api"
+import { isAdminSignedIn } from "@/lib/adminAuth"
 import { LifecycleTracker } from "@/components/LifecycleTracker"
 import { PaymentProgress } from "@/components/PaymentProgress"
 import { Receipt, type ReceiptData } from "@/components/Receipt"
@@ -104,11 +105,16 @@ export function Chat({ agent, config, onChanged, messages, setMessages, transact
         text: detail.reason ?? "I couldn't turn that into a request.",
         parser: config?.parser,
       })
-      // The agent could not name a catalog item. Offer the one legitimate way
-      // forward: a MERCHANT stocks it, with a merchant-set price. The customer
-      // and the model never supply a price -- that invariant is what makes
-      // confirm-time re-validation mean anything.
-      push({ kind: "stock-offer", request: message })
+      // Only offer to stock something when the parser's own classification
+      // says that is what happened: a real product, clearly asked for, that
+      // the catalog does not carry. "ambiguous" ("coffee or tea?") and
+      // "off_topic" (a question, small talk, an injection attempt) are not
+      // requests for an unstocked item, and offering to add one under a
+      // reply that was never about a product is exactly the bug this
+      // classification exists to prevent -- see JOURNAL.md.
+      if (detail.match_kind === "no_match") {
+        push({ kind: "stock-offer", request: message })
+      }
       setThinking(false)
       onChanged()
       return
@@ -236,9 +242,7 @@ export function Chat({ agent, config, onChanged, messages, setMessages, transact
             </span>
             <div className="min-w-0">
               <CardTitle>Shopping agent</CardTitle>
-              <p className="text-xs text-muted-foreground">
-                Intent parser: {config?.parser ?? "…"}
-              </p>
+
             </div>
           </div>
           <div className="flex shrink-0 items-center gap-2">
@@ -672,7 +676,9 @@ function StockOffer({ request, onStocked }: {
     const res = await api.addItem(sku, name.trim(), Math.round(rupeesTyped * 100))
     setBusy(false)
     if (!res.ok) {
-      setError(res.body?.detail?.reason ?? "Could not stock that item.")
+      setError(res.status === 401
+        ? "Signed out. Sign in as admin (Overview tab) and try again."
+        : res.body?.detail?.reason ?? "Could not stock that item.")
       return
     }
     setOpen(false)
@@ -680,6 +686,19 @@ function StockOffer({ request, onStocked }: {
   }
 
   if (!open) {
+    // Stocking an item sets its price, the number confirm-time re-validation
+    // trusts -- a merchant decision, gated the same as the mandate editor.
+    // Checked here rather than only on submit, so a signed-out customer sees
+    // why the form isn't offered instead of filling it in and hitting a 401.
+    if (!isAdminSignedIn()) {
+      return (
+        <div className="max-w-[76%]">
+          <p className="text-xs text-faint">
+            Not stocked. Sign in as admin (Overview tab) to add it.
+          </p>
+        </div>
+      )
+    }
     return (
       <div className="max-w-[76%]">
         <button

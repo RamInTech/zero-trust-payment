@@ -5,6 +5,7 @@
  */
 
 import { seal } from "@/lib/e2e"
+import { adminToken } from "@/lib/adminAuth"
 
 export type Json = Record<string, any>
 
@@ -20,6 +21,27 @@ async function call(path: string, init?: RequestInit): Promise<{ status: number;
 
 const post = (path: string, payload?: Json) =>
   call(path, { method: "POST", body: JSON.stringify(payload ?? {}) })
+
+/**
+ * A request carrying the admin session, for every mandate-edit and
+ * catalog-write route.
+ *
+ * If there is no session (never signed in, or it expired), the request still
+ * goes out with no Authorization header -- the server is what actually
+ * enforces the login, by refusing with 401. This layer only saves the caller
+ * from remembering to attach the header; it is not where the security lives.
+ */
+const adminCall = (method: string, path: string, payload?: Json) => {
+  const token = adminToken()
+  // `call()` spreads `init` over its own default headers rather than
+  // deep-merging, so a bare `headers: {Authorization}` here would silently
+  // drop Content-Type instead of adding to it.
+  const headers: Record<string, string> = { "Content-Type": "application/json" }
+  if (token) headers.Authorization = `Bearer ${token}`
+  return call(path, { method, body: JSON.stringify(payload ?? {}), headers })
+}
+const adminPost = (path: string, payload?: Json) => adminCall("POST", path, payload)
+const adminDelete = (path: string) => adminCall("DELETE", path)
 
 export interface Pending {
   request_id: string
@@ -97,15 +119,39 @@ export const api = {
   decline: (requestId: string) => post(`/api/intents/${requestId}/decline`),
 
   freshAgent: () => post("/demo/agent"),
-  revokeMandate: (agent: string) => post(`/demo/mandate/${agent}/revoke`),
+  // Admin-only from here: the server refuses every one of these without a
+  // valid session, regardless of what this client sends.
+  adminLogin: (username: string, password: string) =>
+    post("/demo/admin/login", { username, password }),
+  revokeMandate: (agent: string) => adminPost(`/demo/mandate/${agent}/revoke`),
   setCap: (agent: string, max_amount_paise: number) =>
-    post(`/demo/mandate/${agent}/cap`, { max_amount_paise }),
+    adminPost(`/demo/mandate/${agent}/cap`, { max_amount_paise }),
+  setAllowlist: (agent: string, skus: string[], allow_any = false) =>
+    adminPost(`/demo/mandate/${agent}/allowlist`, { skus, allow_any }),
+  setExpiry: (agent: string, extends_seconds: number) =>
+    adminPost(`/demo/mandate/${agent}/expiry`, { extends_seconds }),
+  setVelocity: (agent: string, velocity_limit: number, velocity_window_secs: number) =>
+    adminPost(`/demo/mandate/${agent}/velocity`, { velocity_limit, velocity_window_secs }),
+  // Admin-only from here too: stocking, renaming, repricing, and unstocking
+  // an item are all merchant decisions, same reasoning as the mandate routes.
   addItem: (sku: string, name: string, price_paise: number) =>
-    post("/demo/catalog", { sku, name, price_paise }),
+    adminPost("/demo/catalog", { sku, name, price_paise }),
   setPrice: (sku: string, price_paise: number) =>
-    post(`/demo/catalog/${sku}/price`, { price_paise }),
+    adminPost(`/demo/catalog/${sku}/price`, { price_paise }),
+  updateItem: (sku: string, changes: { name?: string; price_paise?: number }) =>
+    adminPost(`/demo/catalog/${sku}`, changes),
+  deleteItem: (sku: string) => adminDelete(`/demo/catalog/${sku}`),
   tamper: () => post("/demo/tamper-audit"),
   armTimeout: () => post("/demo/fault/timeout"),
   compromiseParser: (enabled: boolean) =>
     post(`/demo/parser/compromise?enabled=${enabled}`),
+  simulateWebhook: (tamper: boolean) =>
+    post(`/demo/webhook/simulate?tamper=${tamper}`),
+  /** No token at all -- proves the server refuses, not just the UI. */
+  probeAdminWithoutAuth: (agent: string) =>
+    call(`/demo/mandate/${agent}/cap`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ max_amount_paise: 1 }),
+    }),
 }

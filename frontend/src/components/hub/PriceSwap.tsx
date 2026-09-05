@@ -3,6 +3,7 @@ import { motion } from "framer-motion"
 import { Ban, Zap } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { api } from "@/api"
+import { isAdminSignedIn } from "@/lib/adminAuth"
 import { cn, rupees } from "@/lib/utils"
 
 type Stage = "idle" | "displayed" | "swapped" | "rejected"
@@ -19,8 +20,14 @@ export function PriceSwap({ freshAgent, onChanged }: { freshAgent: () => Promise
   const [stage, setStage] = useState<Stage>("idle")
   const [shown, setShown] = useState<number | null>(null)
   const [busy, setBusy] = useState(false)
+  const [needsAdmin, setNeedsAdmin] = useState(false)
 
   async function run() {
+    // Changing a price is a merchant action, gated behind the same admin
+    // login as the mandate editor -- checked up front rather than letting
+    // the swap fail midway and leave the price altered with no revert.
+    if (!isAdminSignedIn()) { setNeedsAdmin(true); return }
+    setNeedsAdmin(false)
     setBusy(true); setStage("idle")
     const who = await freshAgent()
     const draft = await api.intentFromSku(who, "SKU-COFFEE")
@@ -30,7 +37,8 @@ export function PriceSwap({ freshAgent, onChanged }: { freshAgent: () => Promise
     setStage("displayed")
     await new Promise(r => setTimeout(r, 500))
 
-    await api.setPrice("SKU-COFFEE", p.displayed_amount_paise + 20000)
+    const swapped = await api.setPrice("SKU-COFFEE", p.displayed_amount_paise + 20000)
+    if (!swapped.ok) { setBusy(false); setNeedsAdmin(swapped.status === 401); return }
     setStage("swapped")
     await new Promise(r => setTimeout(r, 500))
 
@@ -53,6 +61,13 @@ export function PriceSwap({ freshAgent, onChanged }: { freshAgent: () => Promise
           {busy ? "Running…" : "Swap the price mid-flight"}
         </Button>
       </div>
+
+      {needsAdmin && (
+        <p className="text-2xs text-faint">
+          Changing a price is a merchant action. Sign in as admin (Overview
+          tab) to run this demonstration.
+        </p>
+      )}
 
       {shown != null && (
         <div className="flex items-center justify-center gap-3 rounded-md border border-border bg-muted/20 py-4">

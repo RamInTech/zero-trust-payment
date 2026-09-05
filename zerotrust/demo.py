@@ -4,7 +4,8 @@ This wraps the production app rather than extending it:
 
     demo = FastAPI()
     demo.mount("/api", create_app(checkout, narrator=narrator,
-                                  recommender=recommender))   # unmodified
+                                  recommender=recommender,
+                                  webhooks=webhooks))   # unmodified
 
 `zerotrust/api.py` gains nothing from this module -- not one route. The reason
 is the same one that kept FastAPI thin in the first place: a rule that lives in
@@ -23,16 +24,19 @@ else.
 
 from __future__ import annotations
 
+import json
 import sqlite3
+import time
 import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from zerotrust.admin_auth import AdminAuth, AdminAuthError, AdminSession
 from zerotrust.api import create_app
 from zerotrust.audit import AuditLog, EventType
 from zerotrust.catalog import Catalog, CatalogItem, ItemNotInCatalog
@@ -79,10 +83,44 @@ class CapChange(BaseModel):
     max_amount_paise: int
 
 
+class AllowlistChange(BaseModel):
+    #: Explicit SKUs, or omit and set allow_any=True for the wildcard.
+    #: Deliberately not both at once -- "everything, plus these three" is not
+    #: a real allowlist, it is the wildcard wearing a disguise.
+    skus: list[str] = []
+    allow_any: bool = False
+
+
+class ExpiryChange(BaseModel):
+    #: A duration from now, not an absolute timestamp. The mandate is always
+    #: issued as "now plus a window" (see run_ui.py), and asking a merchant to
+    #: type a Unix epoch invites exactly the kind of off-by-one-timezone
+    #: mistake this project spends its whole audit-log story arguing against.
+    extends_seconds: float
+
+
+class VelocityChange(BaseModel):
+    velocity_limit: int
+    velocity_window_secs: float
+
+
+class AdminLogin(BaseModel):
+    username: str
+    password: str
+
+
 class NewItem(BaseModel):
     sku: str
     name: str
     price_paise: int
+
+
+class ItemUpdate(BaseModel):
+    #: Both optional -- send whichever changed. Omitting both is refused
+    #: rather than treated as a no-op update, since a request naming no change
+    #: at all is almost certainly a client mistake worth surfacing.
+    name: Optional[str] = None
+    price_paise: Optional[int] = None
 
 
 def _audit_triggers(db_path: str) -> list[str]:
@@ -137,6 +175,35 @@ _STATUS_ORDER = [
 ]
 
 
+def _reissue(engine: PolicyEngine, current: Mandate, **overrides) -> Mandate:
+    """Revoke the active mandate and issue its replacement.
+
+    Every merchant-facing edit route below is this one operation with a
+    different field overridden -- mandates are immutable by design (Phase 3),
+    so "editing" one always means this: the old one is kept, revoked, so the
+    history of what was permitted when is never lost, and a fresh one takes
+    its place with everything unchanged except what the merchant actually
+    asked to change.
+    """
+    engine.mandates.revoke(current.mandate_id)
+    fields = dict(
+        agent_id=current.agent_id,
+        max_amount_paise=current.max_amount_paise,
+        allowed_skus=current.allowed_skus,
+        currency=current.currency,
+        expires_at=current.expires_at,
+        velocity_limit=current.velocity_limit,
+        velocity_window_secs=current.velocity_window_secs,
+        cooldown_denials=current.cooldown_denials,
+        cooldown_window_secs=current.cooldown_window_secs,
+        created_at=engine._clock(),
+    )
+    fields.update(overrides)
+    replacement = Mandate(**fields)
+    engine.mandates.issue(replacement)
+    return replacement
+
+
 def _lifecycle_of(types: set) -> dict:
     """Where this request has got to, and how it ended if it did.
 
@@ -171,6 +238,8 @@ def create_demo_app(
     narrator=None,
     payments_mode: str = "unknown",
     recommender=None,
+    webhooks=None,
+    admin_auth: Optional[AdminAuth] = None,
 ) -> FastAPI:
     demo = FastAPI(
         title="Zero-Trust Payment Authorization — reference client",
@@ -181,7 +250,8 @@ def create_demo_app(
         ),
     )
     demo.mount("/api", create_app(checkout, narrator=narrator,
-                                  recommender=recommender))
+                                  recommender=recommender,
+                                  webhooks=webhooks))
 
     index_html = FRONTEND_DIST / "index.html"
     if index_html.exists():
@@ -194,6 +264,43 @@ def create_demo_app(
         if index_html.exists():
             return FileResponse(index_html)
         return HTMLResponse(_NOT_BUILT, status_code=200)
+
+    def require_admin(authorization: str = Header(default="")) -> AdminSession:
+        """A dependency guarding every mandate-edit, revoke, and catalog-write
+        route.
+
+        Not applied to the rest of `/demo` -- the Security Hub's other proof
+        buttons (tamper-audit, fault injection, parser compromise) are
+        deliberately public demonstrations of what the SYSTEM refuses; this
+        guards the routes that are a genuine merchant decision -- editing the
+        boundary an agent operates inside, or what the shop stocks and at what
+        price -- which is a different kind of action from watching the system
+        defend itself. The Security Hub's own `PriceSwap` demonstration runs
+        through this same gate now, as an authenticated admin action, rather
+        than a route anyone could hit.
+        """
+        if admin_auth is None or not admin_auth.is_configured:
+            raise HTTPException(
+                status_code=501,
+                detail={"reason": "admin login is not configured on this server"})
+        token = authorization[7:] if authorization.startswith("Bearer ") else authorization
+        try:
+            return admin_auth.verify(token)
+        except AdminAuthError as exc:
+            raise HTTPException(status_code=401, detail={"reason": exc.reason})
+
+    @demo.post("/demo/admin/login")
+    def admin_login(body: AdminLogin):
+        if admin_auth is None:
+            raise HTTPException(
+                status_code=501,
+                detail={"reason": "admin login is not configured on this server"})
+        try:
+            token = admin_auth.login(body.username, body.password)
+        except AdminAuthError as exc:
+            raise HTTPException(status_code=401, detail={"reason": exc.reason})
+        return {"session_token": token,
+                "expires_in_seconds": admin_auth.session_ttl_seconds}
 
     @demo.get("/demo/config")
     def config():
@@ -299,7 +406,8 @@ def create_demo_app(
         }
 
     @demo.post("/demo/catalog/{sku}/price")
-    def set_price(sku: str, body: PriceChange):
+    def set_price(sku: str, body: PriceChange,
+                  admin: AdminSession = Depends(require_admin)):
         """Change a price mid-flight, to drive the confirm-time rejection.
 
         A legitimate merchant action, not a backdoor: the purchase that gets
@@ -314,7 +422,7 @@ def create_demo_app(
         return {"sku": sku, "was_paise": before, "now_paise": body.price_paise}
 
     @demo.post("/demo/mandate/{agent}/cap")
-    def set_cap(agent: str, body: CapChange):
+    def set_cap(agent: str, body: CapChange, admin: AdminSession = Depends(require_admin)):
         """Let the merchant move the per-transaction limit.
 
         Issuing a mandate is a MERCHANT action, which is why this is allowed at
@@ -337,25 +445,100 @@ def create_demo_app(
             raise HTTPException(status_code=404,
                                 detail={"reason": f"no mandate for '{agent}'"})
 
-        engine.mandates.revoke(current.mandate_id)
-        engine.mandates.issue(Mandate(
-            agent_id=agent,
-            max_amount_paise=body.max_amount_paise,
-            allowed_skus=current.allowed_skus,
-            currency=current.currency,
-            expires_at=current.expires_at,
-            velocity_limit=current.velocity_limit,
-            velocity_window_secs=current.velocity_window_secs,
-            cooldown_denials=current.cooldown_denials,
-            cooldown_window_secs=current.cooldown_window_secs,
-            created_at=engine._clock(),
-        ))
+        _reissue(engine, current, max_amount_paise=body.max_amount_paise)
         return {"agent_id": agent,
                 "was_paise": current.max_amount_paise,
                 "now_paise": body.max_amount_paise}
 
+    @demo.post("/demo/mandate/{agent}/allowlist")
+    def set_allowlist(agent: str, body: AllowlistChange, admin: AdminSession = Depends(require_admin)):
+        """Let the merchant change which items the agent may buy at all.
+
+        Same merchant-only reasoning as `set_cap`: the agent cannot reach this
+        route, and nothing here lets an agent add itself to its own allowlist.
+        `allow_any` is the wildcard used elsewhere in this codebase (ANY_SKU) --
+        the cap remains the constraint that actually bounds spend when it's
+        set, so widening the allowlist is not the same as removing all limits.
+        """
+        current = engine.mandates.active_for_agent(agent)
+        if current is None:
+            raise HTTPException(status_code=404,
+                                detail={"reason": f"no mandate for '{agent}'"})
+
+        if body.allow_any:
+            skus = frozenset({ANY_SKU})
+        else:
+            unknown = []
+            for s in body.skus:
+                try:
+                    catalog.get(s)
+                except ItemNotInCatalog:
+                    unknown.append(s)
+            if unknown:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"reason": f"not in the catalog: {', '.join(unknown)}"})
+            if not body.skus:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"reason": "an allowlist needs at least one SKU, "
+                                      "or allow_any=true for the wildcard"})
+            skus = frozenset(body.skus)
+
+        _reissue(engine, current, allowed_skus=skus)
+        return {"agent_id": agent,
+                "was_skus": sorted(current.allowed_skus),
+                "now_skus": sorted(skus)}
+
+    @demo.post("/demo/mandate/{agent}/expiry")
+    def set_expiry(agent: str, body: ExpiryChange, admin: AdminSession = Depends(require_admin)):
+        """Let the merchant push out (or pull in) when the mandate lapses."""
+        if body.extends_seconds <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail={"reason": "extends_seconds must be positive -- to "
+                                  "shorten a mandate to expire sooner, use a "
+                                  "smaller positive value from now, not a "
+                                  "negative one; to end it immediately, revoke it"})
+
+        current = engine.mandates.active_for_agent(agent)
+        if current is None:
+            raise HTTPException(status_code=404,
+                                detail={"reason": f"no mandate for '{agent}'"})
+
+        new_expiry = engine._clock() + body.extends_seconds
+        _reissue(engine, current, expires_at=new_expiry)
+        return {"agent_id": agent,
+                "was_expires_at": current.expires_at,
+                "now_expires_at": new_expiry}
+
+    @demo.post("/demo/mandate/{agent}/velocity")
+    def set_velocity(agent: str, body: VelocityChange, admin: AdminSession = Depends(require_admin)):
+        """Let the merchant change the spend-frequency limit and its window."""
+        if body.velocity_limit <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail={"reason": "velocity_limit must be a positive integer"})
+        if body.velocity_window_secs <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail={"reason": "velocity_window_secs must be positive"})
+
+        current = engine.mandates.active_for_agent(agent)
+        if current is None:
+            raise HTTPException(status_code=404,
+                                detail={"reason": f"no mandate for '{agent}'"})
+
+        _reissue(engine, current, velocity_limit=body.velocity_limit,
+                velocity_window_secs=body.velocity_window_secs)
+        return {"agent_id": agent,
+                "was": {"velocity_limit": current.velocity_limit,
+                        "velocity_window_secs": current.velocity_window_secs},
+                "now": {"velocity_limit": body.velocity_limit,
+                        "velocity_window_secs": body.velocity_window_secs}}
+
     @demo.post("/demo/mandate/{agent}/revoke")
-    def revoke_mandate(agent: str):
+    def revoke_mandate(agent: str, admin: AdminSession = Depends(require_admin)):
         """Withdraw an agent's authority immediately -- the kill switch.
 
         A MERCHANT action, like setting the cap: the mandate is the merchant's
@@ -385,11 +568,11 @@ def create_demo_app(
         }
 
     @demo.post("/demo/catalog")
-    def add_item(body: NewItem):
+    def add_item(body: NewItem, admin: AdminSession = Depends(require_admin)):
         """Stock a new product, so an agent can be asked for anything.
 
-        Also a merchant action, and the reason it is safe: the PRICE is set
-        here, by the merchant, and stored in the catalog. Neither the customer
+        A merchant action, and the reason it is safe: the PRICE is set here,
+        by the merchant, and stored in the catalog. Neither the customer
         nor the model supplies it. That keeps the invariant that makes
         confirm-time re-validation meaningful -- prices come from the catalog,
         never from the request (see `_SYSTEM_PROMPT` in zerotrust/intent.py).
@@ -420,6 +603,62 @@ def create_demo_app(
             # buy it" is otherwise a confusing five minutes.
             "purchasable_by_agent": bool(mandate and mandate.allows_sku(sku)),
         }
+
+    @demo.post("/demo/catalog/{sku}")
+    def update_item(sku: str, body: ItemUpdate,
+                     admin: AdminSession = Depends(require_admin)):
+        """Rename an item and/or reprice it in one call.
+
+        The SKU itself is never editable -- it is what every reference to
+        this item (an allowlist, a pending purchase, the audit log) is keyed
+        on, so changing it would silently orphan all of them. Renaming or
+        repricing leaves it alone; only `name` and/or `price_paise` move.
+        """
+        if body.name is None and body.price_paise is None:
+            raise HTTPException(
+                status_code=400,
+                detail={"reason": "name and/or price_paise must be given"})
+        if body.price_paise is not None and body.price_paise <= 0:
+            raise HTTPException(status_code=400,
+                                detail={"reason": "price must be positive"})
+        if body.name is not None and not body.name.strip():
+            raise HTTPException(status_code=400,
+                                detail={"reason": "name cannot be blank"})
+        try:
+            before = catalog.get(sku)
+        except ItemNotInCatalog as exc:
+            raise HTTPException(status_code=404, detail={"reason": str(exc)})
+
+        if body.name is not None:
+            catalog.rename(sku, body.name.strip())
+        if body.price_paise is not None:
+            catalog.set_price(sku, body.price_paise)
+
+        after = catalog.get(sku)
+        return {
+            "sku": sku,
+            "was_name": before.name, "now_name": after.name,
+            "was_paise": before.price_paise, "now_paise": after.price_paise,
+        }
+
+    @demo.delete("/demo/catalog/{sku}")
+    def delete_item(sku: str, admin: AdminSession = Depends(require_admin)):
+        """Unstock an item entirely.
+
+        A mandate's allowlist may still name this SKU afterwards -- left as
+        is, not cleaned up, because reaching into every agent's mandate from
+        here would make this route responsible for a decision it has no
+        business making. The effect is still correct: a purchase attempt
+        against a removed SKU fails at the catalog lookup with
+        `ITEM_NOT_IN_CATALOG`, before the policy engine ever runs, same as any
+        SKU that never existed.
+        """
+        try:
+            item = catalog.get(sku)
+        except ItemNotInCatalog as exc:
+            raise HTTPException(status_code=404, detail={"reason": str(exc)})
+        catalog.remove(sku)
+        return {"sku": sku, "was_name": item.name, "was_paise": item.price_paise}
 
     @demo.post("/demo/tamper-audit")
     def tamper_audit():
@@ -551,6 +790,60 @@ def create_demo_app(
                                 detail={"reason": "no scheduler in this stack"})
         return scheduler.run_once().as_dict()
 
+    @demo.post("/demo/webhook/simulate")
+    def simulate_webhook(tamper: bool = False):
+        """Send this server a webhook it signs itself. DEMO ONLY.
+
+        No real Razorpay delivery arrives in this project: capture is
+        simulated, and `order.paid` only fires after a genuine browser
+        checkout. Rather than leave the receiver unexercised, this builds a
+        Razorpay-shaped payload, signs it with the configured secret, and posts
+        it through the same verification path an external delivery would take.
+
+        It is labelled synthetic in its own payload and in the response, so
+        nothing here can be mistaken for evidence that live delivery works.
+        With `tamper=true` the body is edited AFTER signing -- the signature
+        then covers different bytes, and the receiver refuses it.
+        """
+        if webhooks is None or not webhooks.is_configured:
+            raise HTTPException(
+                status_code=501,
+                detail={
+                    "reason": "no RAZORPAY_WEBHOOK_SECRET configured, so the "
+                              "receiver refuses every delivery rather than "
+                              "trusting it",
+                })
+
+        from zerotrust.webhook import compute_signature
+
+        body = json.dumps({
+            "entity": "event",
+            "event": "order.paid",
+            "created_at": int(time.time()),
+            "synthetic": True,
+            "payload": {"order": {"entity": {
+                "id": "order_SYNTHETIC",
+                "receipt": "ui_synthetic_demo",
+                "amount": 15000,
+                "status": "paid",
+            }}},
+        }).encode("utf-8")
+        signature = compute_signature(body, webhooks.secret)
+
+        if tamper:
+            # Signed, then altered. This is exactly the attack the HMAC exists
+            # to stop, performed on the real receiver rather than described.
+            body = body.replace(b'"amount": 15000', b'"amount": 100000000')
+
+        result = webhooks.receive(body, signature)
+        return {
+            "synthetic": True,
+            "note": ("Generated and signed by this server. Razorpay sent "
+                     "nothing; test mode produces no real delivery."),
+            "tampered_after_signing": tamper,
+            "result": result.as_dict(),
+        }
+
     @demo.get("/demo/stats")
     def stats():
         """Dashboard totals, derived from the audit log rather than counted
@@ -638,6 +931,7 @@ def create_demo_app(
         being rendered as though they were.
         """
         triggers = _audit_triggers(audit.db_path)
+        chain = audit.verify()
         parsed_fields = sorted(ParsedIntent.__dataclass_fields__)
         # Named from the parser actually in use, not from an env var: an
         # unused key must not make the page claim data goes somewhere it does
@@ -695,12 +989,91 @@ def create_demo_app(
                 },
                 {
                     "id": "append_only_audit",
-                    "title": "Append-only audit log",
-                    "mechanism": "BEFORE UPDATE / BEFORE DELETE triggers RAISE(ABORT)",
+                    "title": "Append-only, hash-chained audit log",
+                    "mechanism": (
+                        "BEFORE UPDATE / BEFORE DELETE triggers RAISE(ABORT); "
+                        "each entry carries the SHA-256 of its contents linked "
+                        "to its predecessor"
+                    ),
+                    # The chain detects what the triggers cannot see: a change
+                    # made around the database rather than through it. Say
+                    # plainly where that stops, because a self-consistent chain
+                    # is not the same as an unaltered one.
+                    "boundary": (
+                        "The triggers refuse edits through the database; the "
+                        "chain makes an edit made around it — a swapped file, "
+                        "a restored backup, a row rewritten after dropping the "
+                        "triggers — detectable. It does not detect a complete "
+                        "rewrite: anyone able to drop the triggers can also "
+                        "recompute every later hash. Catching that needs the "
+                        "head hash below compared against a copy held "
+                        "elsewhere, which this demo does not do."
+                    ),
                     "evidence": {
                         "entries": len(audit.all()),
+                        # The string, not the bare boolean: `intact` is True on
+                        # a log with nothing chained, and "chain intact" beside
+                        # zero protected entries is a claim this page must not
+                        # make. See ChainReport.summary.
+                        "hash_chain": chain.summary,
+                        "head_hash": (chain.head or "—")[:16],
                         "triggers": triggers,
                         "guarantee_present": len(triggers) >= 2,
+                    },
+                },
+                {
+                    "id": "webhook_verification",
+                    "title": "Webhooks are verified, and cannot authorise",
+                    "mechanism": (
+                        "HMAC-SHA256 over the raw request body, compared with "
+                        "hmac.compare_digest; a verified delivery triggers "
+                        "reconciliation and writes nothing"
+                    ),
+                    "boundary": (
+                        "No real Razorpay delivery reaches this project: "
+                        "capture is simulated and order.paid needs a genuine "
+                        "browser checkout, so the demonstration signs its own "
+                        "delivery and says so. The signature proves who sent a "
+                        "message, never that its contents are true — which is "
+                        "why the payload's amounts and statuses are discarded "
+                        "and only the receipt is used, to go and ask the "
+                        "provider directly."
+                    ),
+                    "evidence": {
+                        "receiver_configured": bool(
+                            webhooks is not None and webhooks.is_configured),
+                        "verified_deliveries": audit.count_of(
+                            EventType.WEBHOOK_RECEIVED),
+                        "refused_deliveries": audit.count_of(
+                            EventType.WEBHOOK_REJECTED),
+                        "can_write_the_ledger": False,
+                    },
+                },
+                {
+                    "id": "admin_auth",
+                    "title": "Editing the mandate requires a real login",
+                    "mechanism": (
+                        "bcrypt-hashed password, a short-lived HMAC-signed "
+                        "session; an unconfigured admin refuses every login "
+                        "rather than leaving the mandate editor open"
+                    ),
+                    "boundary": (
+                        "One admin account, not a multi-user system — this "
+                        "matches the one-merchant shape of the rest of the "
+                        "reference client, not a claim of role-based access "
+                        "control. The session is stateless (verified by "
+                        "recomputing its signature, never looked up), so it "
+                        "does not survive changing the signing secret, and "
+                        "'multi-factor' genuinely is not implemented: a "
+                        "password is the only factor."
+                    ),
+                    "evidence": {
+                        "admin_login_configured": bool(
+                            admin_auth is not None and admin_auth.is_configured),
+                        "session_ttl_seconds": (
+                            admin_auth.session_ttl_seconds
+                            if admin_auth is not None else 0),
+                        "mandate_edit_routes_gated": 5,
                     },
                 },
                 {
@@ -792,7 +1165,10 @@ def create_demo_app(
                 {"id": "tokenization", "title": "Tokenization",
                  "note": "Not implemented. Card data never reaches this system."},
                 {"id": "mfa", "title": "Multi-factor authentication",
-                 "note": "Not implemented. No user system, no login, no sessions."},
+                 "note": ("Not implemented for the one admin login this system "
+                         "has (see 'Editing the mandate requires a real login' "
+                         "above) — a password is the only factor, and there is "
+                         "no per-customer account system at all.")},
             ],
         }
 
