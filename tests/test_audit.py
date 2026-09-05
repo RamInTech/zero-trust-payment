@@ -425,3 +425,246 @@ def test_concurrent_writers_lose_no_entries(tmp_path, clock, run):
     assert len(log.all()) == threads_n * per_thread
     ids = [e.event_id for e in log.all()]
     assert len(set(ids)) == len(ids), "duplicate event ids"
+
+
+# -- the hash chain --------------------------------------------------------
+#
+# The triggers stop tampering THROUGH the database. These cover tampering that
+# goes AROUND it: dropping the triggers, editing the file directly, restoring a
+# doctored backup. Every case here first proves the tampering SUCCEEDED at the
+# SQL level, so the assertion is that the chain detected a real edit rather
+# than that something else blocked it.
+
+def _log(tmp_path, name="chain.db"):
+    return AuditLog(str(tmp_path / name))
+
+
+def _fill(log, n=4):
+    for i in range(n):
+        log.record(EventType.POLICY_APPROVED, Actor.POLICY_ENGINE,
+                   request_id=f"req_{i}", reason="all mandate rules satisfied")
+
+
+def _unlocked(log):
+    """A raw connection with the append-only triggers removed.
+
+    Dropping them is allowed -- that is precisely the gap the chain exists to
+    cover, and a test that could not drop them would be testing the triggers
+    again instead of the chain.
+    """
+    conn = sqlite3.connect(log.db_path, isolation_level=None)
+    conn.execute("DROP TRIGGER IF EXISTS audit_log_no_update")
+    conn.execute("DROP TRIGGER IF EXISTS audit_log_no_delete")
+    return conn
+
+
+def test_a_clean_log_verifies(tmp_path):
+    log = _log(tmp_path)
+    _fill(log)
+    report = log.verify()
+    assert report.intact is True
+    assert report.checked == 4
+    assert report.unverifiable == 0
+    assert report.broken_at is None
+
+
+def test_editing_a_row_breaks_the_chain(tmp_path):
+    log = _log(tmp_path)
+    _fill(log)
+    conn = _unlocked(log)
+    conn.execute("UPDATE audit_log SET reason = 'nothing to see here' "
+                 "WHERE event_id = 2")
+    # The edit really landed -- otherwise this would be re-testing the triggers.
+    assert conn.execute(
+        "SELECT reason FROM audit_log WHERE event_id = 2"
+    ).fetchone()[0] == "nothing to see here"
+    conn.close()
+
+    report = log.verify()
+    assert report.intact is False
+    assert report.broken_at == 2
+    assert "contents were altered" in report.detail
+
+
+def test_deleting_a_row_breaks_the_chain(tmp_path):
+    log = _log(tmp_path)
+    _fill(log)
+    conn = _unlocked(log)
+    conn.execute("DELETE FROM audit_log WHERE event_id = 2")
+    assert conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0] == 3
+    conn.close()
+
+    report = log.verify()
+    assert report.intact is False
+    # Entry 3 is where the break shows: it points at a predecessor that is gone.
+    assert report.broken_at == 3
+    assert "removed, reordered, or inserted" in report.detail
+
+
+def test_renumbering_a_row_breaks_the_chain(tmp_path):
+    """The event_id is inside the hash, so resequencing is detected too."""
+    log = _log(tmp_path)
+    _fill(log)
+    conn = _unlocked(log)
+    conn.execute("UPDATE audit_log SET event_id = 99 WHERE event_id = 4")
+    conn.close()
+
+    report = log.verify()
+    assert report.intact is False
+    assert report.broken_at == 99
+
+
+def test_a_forged_entry_appended_by_hand_is_rejected(tmp_path):
+    """Inserting a row without recomputing its hash does not pass."""
+    log = _log(tmp_path)
+    _fill(log, 2)
+    conn = _unlocked(log)
+    conn.execute(
+        "INSERT INTO audit_log (event_id, event_type, actor, occurred_at, "
+        "request_id, details, prev_hash, entry_hash) "
+        "VALUES (3, 'POLICY_APPROVED', 'POLICY_ENGINE', 1.0, 'req_forged', "
+        "'{}', ?, 'deadbeef')",
+        (log.head(),))
+    conn.close()
+
+    report = log.verify()
+    assert report.intact is False
+    assert report.broken_at == 3
+
+
+def test_rows_written_before_the_chain_are_reported_not_assumed_sound(tmp_path):
+    """A pre-chain row is unverifiable, which is not the same as verified.
+
+    The triggers forbid the UPDATE that backfilling a hash would need, so these
+    rows can never be brought into the chain. Counting them as intact would
+    turn the absence of evidence into evidence.
+    """
+    log = _log(tmp_path)
+    _fill(log, 1)
+    conn = _unlocked(log)
+    conn.execute(
+        "INSERT INTO audit_log (event_id, event_type, actor, occurred_at, "
+        "details, prev_hash, entry_hash) "
+        "VALUES (0, 'POLICY_APPROVED', 'POLICY_ENGINE', 0.5, '{}', NULL, NULL)")
+    conn.close()
+
+    report = log.verify()
+    assert report.intact is True
+    assert report.unverifiable == 1
+    assert report.checked == 1
+
+
+def test_the_chain_survives_a_reopen(tmp_path):
+    """Reopening must migrate, not restart the chain from genesis."""
+    log = _log(tmp_path)
+    _fill(log, 2)
+    head_before = log.head()
+
+    reopened = AuditLog(str(tmp_path / "chain.db"))
+    reopened.record(EventType.POLICY_DENIED, Actor.POLICY_ENGINE,
+                    request_id="req_x", rule="AMOUNT_EXCEEDS_CAP")
+    assert reopened.verify().intact is True
+    assert reopened.verify().checked == 3
+    # The new entry linked to the old head rather than to GENESIS.
+    conn = sqlite3.connect(log.db_path)
+    assert conn.execute(
+        "SELECT prev_hash FROM audit_log WHERE event_id = 3").fetchone()[0] == head_before
+    conn.close()
+
+
+def test_a_database_predating_the_chain_gains_the_columns(tmp_path):
+    """CREATE TABLE IF NOT EXISTS is a no-op, so the migration must ALTER."""
+    path = str(tmp_path / "old.db")
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.execute(
+        "CREATE TABLE audit_log ("
+        " event_id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT NOT NULL,"
+        " actor TEXT NOT NULL, occurred_at REAL NOT NULL, request_id TEXT,"
+        " agent_id TEXT, mandate_id TEXT, idempotency_key TEXT, rule TEXT,"
+        " reason TEXT, details TEXT NOT NULL DEFAULT '{}')")
+    conn.execute(
+        "INSERT INTO audit_log (event_type, actor, occurred_at, details) "
+        "VALUES ('POLICY_APPROVED', 'POLICY_ENGINE', 1.0, '{}')")
+    conn.close()
+
+    log = AuditLog(path)          # must not raise
+    log.record(EventType.POLICY_APPROVED, Actor.POLICY_ENGINE, request_id="r")
+    report = log.verify()
+    assert report.unverifiable == 1
+    assert report.checked == 1
+    assert report.intact is True
+
+
+def test_concurrent_appends_produce_one_unbroken_chain(tmp_path):
+    """Eight threads appending at once must not fork the chain.
+
+    Each link names its predecessor, so two writers reading the same tail would
+    produce two rows sharing one prev_hash. The fork verifies cleanly from
+    either side, which is why this needs its own test rather than being assumed
+    from the single-threaded case.
+    """
+    log = _log(tmp_path)
+    errors = []
+
+    def append(i):
+        try:
+            log.record(EventType.POLICY_APPROVED, Actor.POLICY_ENGINE,
+                       request_id=f"req_{i}", reason=f"thread {i}")
+        except Exception as exc:  # pragma: no cover - surfaced via `errors`
+            errors.append(exc)
+
+    threads = [threading.Thread(target=append, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    report = log.verify()
+    assert report.intact is True
+    assert report.checked == 8
+
+    conn = sqlite3.connect(log.db_path)
+    distinct = conn.execute(
+        "SELECT COUNT(DISTINCT prev_hash) FROM audit_log").fetchone()[0]
+    conn.close()
+    assert distinct == 8, "two entries share a predecessor: the chain forked"
+
+
+def test_an_unchained_log_does_not_report_itself_as_protected(tmp_path):
+    """`intact` is vacuously True with nothing chained; the summary must not be.
+
+    A log of 132 pre-chain rows verifies as intact because no link failed. If a
+    UI renders that boolean as "chain intact", it tells a viewer their entries
+    are protected when not one of them is — the exact overclaim this project
+    exists to avoid.
+    """
+    log = _log(tmp_path, "empty.db")
+    empty = log.verify()
+    assert empty.intact is True and empty.checked == 0
+    assert empty.summary == "no entries yet"
+
+    conn = _unlocked(log)
+    conn.execute(
+        "INSERT INTO audit_log (event_id, event_type, actor, occurred_at, "
+        "details, prev_hash, entry_hash) "
+        "VALUES (1, 'POLICY_APPROVED', 'POLICY_ENGINE', 1.0, '{}', NULL, NULL)")
+    conn.close()
+
+    report = log.verify()
+    assert report.intact is True
+    assert "no entries chained yet" in report.summary
+    assert "intact" not in report.summary
+
+    log.record(EventType.POLICY_APPROVED, Actor.POLICY_ENGINE, request_id="r")
+    mixed = log.verify()
+    assert mixed.summary == "intact — 1 verified, 1 predate the chain"
+
+
+def test_a_broken_chain_says_so_in_the_summary(tmp_path):
+    log = _log(tmp_path, "broken.db")
+    _fill(log, 3)
+    conn = _unlocked(log)
+    conn.execute("UPDATE audit_log SET reason = 'edited' WHERE event_id = 2")
+    conn.close()
+    assert log.verify().summary == "BROKEN at entry 2"
