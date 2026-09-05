@@ -64,9 +64,9 @@ export default function App() {
   const [tab, setTab] = useState("chat")
 
   const refresh = useCallback(async (who = agent) => {
-    const [m, s, a, t, l, w] = await Promise.all([
+    const [m, s, a, t, l, w, c] = await Promise.all([
       api.mandate(who), api.stats(), api.audit(), api.transactions(), api.layers(),
-      api.sweep(),
+      api.sweep(), api.catalog(),
     ])
     if (m.ok) setMandate(m.body)
     if (s.ok) setStats(s.body)
@@ -74,6 +74,12 @@ export default function App() {
     if (t.ok) setTransactions(t.body.transactions)
     if (l.ok) setLayers(l.body)
     if (w.ok) setSweep(w.body)
+    // Stocking, renaming, repricing, or removing a catalog item all call
+    // onChanged() (== this function) -- without refetching here, the
+    // catalog held in state would go stale the moment any of those ran,
+    // and every view reading it (this dashboard's table, the mandate
+    // allowlist's "add" dropdown) would silently show the pre-edit list.
+    if (c.ok) setCatalog(c.body.items)
   }, [agent])
 
   useEffect(() => {
@@ -177,12 +183,7 @@ export default function App() {
             </ul>
           </nav>
 
-          {!collapsed && (
-            <p className="whitespace-normal px-5 pb-4 text-2xs leading-relaxed text-faint">
-              Built on Razorpay test mode. Not an official Razorpay product.
-              Capture is simulated.
-            </p>
-          )}
+
 
           <div className={cn("border-t border-border py-2", collapsed ? "px-2" : "px-3")}>
             <button
@@ -219,32 +220,6 @@ export default function App() {
                 <p className="text-xs text-muted-foreground">{current?.blurb}</p>
               </div>
               <div className="flex shrink-0 items-center gap-3">
-                {/* Reports what the backend is actually doing. A static
-                    "Test mode" read the same whether orders reached Razorpay
-                    or never left the process, which is the one distinction
-                    this badge exists to make. */}
-                <span className="hidden items-center gap-1.5 text-xs text-muted-foreground sm:flex"
-                      title={
-                        config?.payments_mode === "razorpay-test"
-                          ? "Real server-to-server calls to Razorpay's test-mode API. Real orders, no real money."
-                          : config?.payments_mode === "simulated"
-                            ? "No Razorpay credentials configured — orders are generated locally and never leave this machine."
-                            : "Payment mode not reported by the backend."
-                      }>
-                  <span
-                    className={cn("h-1.5 w-1.5 rounded-full",
-                      config?.payments_mode === "razorpay-test" ? "bg-ok"
-                        : config?.payments_mode === "simulated" ? "bg-warn"
-                          : "bg-muted-foreground")}
-                    aria-hidden="true"
-                  />
-                  {config?.payments_mode === "razorpay-test" ? "Razorpay test mode"
-                    : config?.payments_mode === "simulated" ? "Simulated payments"
-                      : "Payments: unknown"}
-                </span>
-                <span className="mono rounded-md bg-muted px-2 py-1 text-muted-foreground">
-                  {agent}
-                </span>
               </div>
             </div>
           </header>
@@ -265,7 +240,7 @@ export default function App() {
                 </TabsContent>
                 <TabsContent value="dashboard" className="focus-visible:outline-none">
                   <Dashboard mandate={mandate} stats={stats} audit={audit} sweep={sweep}
-                             agent={agent} onChanged={() => refresh()} />
+                             agent={agent} catalog={catalog} onChanged={() => refresh()} />
                 </TabsContent>
                 <TabsContent value="checkout" className="focus-visible:outline-none">
                   <Checkout agent={agent} catalog={catalog} onChanged={() => refresh()} />

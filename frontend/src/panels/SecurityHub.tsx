@@ -12,7 +12,34 @@ import { UnknownOutcomeTimeline } from "@/components/hub/UnknownOutcomeTimeline"
 import { InjectionAttempt } from "@/components/hub/InjectionAttempt"
 import { CiphertextReveal } from "@/components/hub/CiphertextReveal"
 import { KillSwitch } from "@/components/hub/KillSwitch"
+import { WebhookVerification } from "@/components/hub/WebhookVerification"
+import { AdminAuthProbe } from "@/components/hub/AdminAuthProbe"
 import { cn } from "@/lib/utils"
+
+type DemoProps = { freshAgent: () => Promise<string>; onChanged?: () => void }
+
+//: Defined once, at module scope. These used to be built fresh inside the
+//: component's render body as `id: () => <Foo ... />` -- a new arrow-function
+//: *component* on every render. React treats a changed component identity as
+//: a different component, so any re-render of SecurityHub (which happens on
+//: every onChanged(), i.e. right after a demonstration finishes and reports
+//: its own result) unmounted the demonstration and mounted a fresh one,
+//: wiping the very state it had just set. That's why a result flashed for a
+//: moment and then vanished. Stable references here fix it: React sees the
+//: same component across renders and only the props change.
+const DEMONSTRATIONS: Record<string, React.ComponentType<DemoProps>> = {
+  exactly_once: DoubleChargeRace,
+  mandate: MandateOverride,
+  confirmation: VelocityBurst,
+  append_only_audit: TamperTimeline,
+  webhook_verification: WebhookVerification,
+  admin_auth: AdminAuthProbe,
+  price_revalidation: PriceSwap,
+  unknown_outcomes: UnknownOutcomeTimeline,
+  llm_no_authority: InjectionAttempt,
+  e2e_chat_encryption: CiphertextReveal,
+  instant_revocation: KillSwitch,
+}
 
 /**
  * Every panel here is backed by a mechanism that exists. The three layers a
@@ -45,22 +72,6 @@ export function SecurityHub({ agent, layers, adversarial, onChanged }: {
     return res.ok ? (res.body.agent_id as string) : agent
   }
 
-  //: One live component per mechanism. Keyed by the same `id` the backend
-  //: reports in `/demo/security/layers`, so a mechanism added there without
-  //: a matching entry here is immediately visible as a gap, not silently
-  //: falling back to nothing.
-  const demonstrations: Record<string, () => React.JSX.Element> = {
-    exactly_once: () => <DoubleChargeRace freshAgent={freshAgent} onChanged={onChanged} />,
-    mandate: () => <MandateOverride freshAgent={freshAgent} onChanged={onChanged} />,
-    confirmation: () => <VelocityBurst freshAgent={freshAgent} onChanged={onChanged} />,
-    append_only_audit: () => <TamperTimeline onChanged={onChanged} />,
-    price_revalidation: () => <PriceSwap freshAgent={freshAgent} onChanged={onChanged} />,
-    unknown_outcomes: () => <UnknownOutcomeTimeline freshAgent={freshAgent} onChanged={onChanged} />,
-    llm_no_authority: () => <InjectionAttempt freshAgent={freshAgent} onChanged={onChanged} />,
-    e2e_chat_encryption: () => <CiphertextReveal freshAgent={freshAgent} onChanged={onChanged} />,
-    instant_revocation: () => <KillSwitch freshAgent={freshAgent} onChanged={onChanged} />,
-  }
-
   const cards = (layers?.implemented ?? []) as Json[]
   const totals = adversarial?.totals
 
@@ -73,7 +84,7 @@ export function SecurityHub({ agent, layers, adversarial, onChanged }: {
 
       <div className="grid gap-4 md:grid-cols-2">
         {cards.map(layer => {
-          const Demonstration = demonstrations[layer.id]
+          const Demonstration = DEMONSTRATIONS[layer.id]
           return (
             <Card key={layer.id} className="flex flex-col">
               <CardHeader>
@@ -111,7 +122,7 @@ export function SecurityHub({ agent, layers, adversarial, onChanged }: {
                 </Rows>
 
                 <div className="mt-auto">
-                  {Demonstration ? <Demonstration /> : (
+                  {Demonstration ? <Demonstration freshAgent={freshAgent} onChanged={onChanged} /> : (
                     <p className="text-2xs text-faint">
                       No live demonstration wired up for this mechanism yet.
                     </p>
