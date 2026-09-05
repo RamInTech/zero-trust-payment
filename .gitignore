@@ -40,3 +40,10 @@ htmlcov/
 .idea/
 .vscode/
 *.swp
+
+# Playwright MCP session artifacts (screenshots, page snapshots, console logs)
+.playwright-mcp/
+docs/protocol-alignment.md
+docs/adversarial-results.md
+docs/pitch-script.md
+docs/adversarial-results.md

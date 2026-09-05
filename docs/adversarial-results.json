@@ -112,7 +112,7 @@
       "attack": "Spend under a mandate that has already expired",
       "defence": "Policy engine: MANDATE_EXPIRED",
       "defended": true,
-      "evidence": "mandate mdt_8ad4d900c726 expired 1s ago",
+      "evidence": "mandate mdt_dc71e710afea expired 1s ago",
       "expected": "Denied, citing expiry specifically",
       "intended_actions": 0,
       "money_actions": 0,
@@ -169,8 +169,8 @@
       "surface": "direct database access"
     }
   ],
-  "generated_at": 1788203039.812233,
-  "generated_at_utc": "2026-08-31 19:03:59 UTC",
+  "generated_at": 1788594756.809592,
+  "generated_at_utc": "2026-09-05 07:52:36 UTC",
   "mandate": {
     "allowed_skus": [
       "SKU-CAKE",
