@@ -335,6 +335,79 @@ def test_the_demo_refuses_to_run_without_the_guarantee(stack, tmp_path):
     assert unprotected.all() == []
 
 
+# -- the hash chain catches what the triggers cannot ------------------------
+
+def test_the_chain_break_demo_shows_intact_then_broken(stack):
+    body = stack["client"].post("/demo/audit/chain-break").json()
+
+    assert body["before"]["intact"] is True
+    assert body["before"]["checked"] >= 4
+    assert body["after"]["intact"] is False
+    assert body["after"]["broken_at"] is not None
+    assert "BROKEN" in body["after"]["summary"]
+
+
+def test_the_chain_break_demo_names_the_first_altered_entry(stack):
+    """The tampered row is the third of four seeded entries (POLICY_APPROVED)."""
+    body = stack["client"].post("/demo/audit/chain-break").json()
+    assert body["after"]["broken_at"] == 3
+
+
+def test_the_chain_break_demo_never_touches_the_real_audit_log(stack):
+    """Runs against a throwaway copy -- the live log this session actually
+    uses must still report an intact chain afterward."""
+    client = stack["client"]
+    real_before = client.get("/demo/audit/recent").json()["count"]
+
+    client.post("/demo/audit/chain-break")
+
+    real_after = client.get("/demo/audit/recent").json()["count"]
+    assert real_after == real_before
+    layers = client.get("/demo/security/layers").json()
+    audit_card = next(l for l in layers["implemented"] if l["id"] == "append_only_audit")
+    assert "BROKEN" not in audit_card["evidence"]["hash_chain"]
+
+
+def test_the_chain_break_demo_is_labelled_synthetic(stack):
+    body = stack["client"].post("/demo/audit/chain-break").json()
+    assert body["synthetic"] is True
+    assert "throwaway" in body["note"]
+
+
+# -- the audit write happens before the money moves --------------------------
+
+def test_the_write_blocks_payment_demo_shows_the_payment_never_ran(stack):
+    body = stack["client"].post("/demo/audit/write-blocks-payment").json()
+
+    assert body["blocked"] is True
+    assert body["raised"] is not None
+    assert "audit log cannot be written" in body["raised"]
+    assert body["provider_calls"] == 0
+
+
+def test_the_write_blocks_payment_demo_is_labelled_synthetic(stack):
+    body = stack["client"].post("/demo/audit/write-blocks-payment").json()
+    assert body["synthetic"] is True
+    assert "throwaway" in body["note"]
+
+
+def test_the_write_blocks_payment_demo_never_touches_the_real_audit_log(stack):
+    client = stack["client"]
+    real_before = client.get("/demo/audit/recent").json()["count"]
+
+    client.post("/demo/audit/write-blocks-payment")
+
+    real_after = client.get("/demo/audit/recent").json()["count"]
+    assert real_after == real_before
+
+
+def test_the_audit_before_payment_card_is_in_the_security_layers(stack):
+    layers = stack["client"].get("/demo/security/layers").json()
+    card = next(l for l in layers["implemented"] if l["id"] == "audit_before_payment")
+    assert "before" in card["mechanism"].lower()
+    assert card["evidence"]["payment_captured"] >= 0
+
+
 def test_the_idempotency_key_is_visible_on_the_demo_view_only(stack):
     """The key is shown for transparency, without touching the API's response."""
     client = stack["client"]
@@ -409,7 +482,7 @@ def test_security_layers_report_only_real_mechanisms(stack):
     ids = {layer["id"] for layer in body["implemented"]}
     assert ids == {
         "exactly_once", "mandate", "confirmation", "append_only_audit",
-        "webhook_verification", "admin_auth",
+        "audit_before_payment", "webhook_verification", "admin_auth",
         "price_revalidation", "unknown_outcomes", "llm_no_authority",
         "e2e_chat_encryption", "instant_revocation",
     }

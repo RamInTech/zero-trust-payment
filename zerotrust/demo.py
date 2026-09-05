@@ -25,7 +25,10 @@ else.
 from __future__ import annotations
 
 import json
+import os
+import secrets
 import sqlite3
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -38,14 +41,16 @@ from pydantic import BaseModel
 
 from zerotrust.admin_auth import AdminAuth, AdminAuthError, AdminSession
 from zerotrust.api import create_app
-from zerotrust.audit import AuditLog, EventType
+from zerotrust.audit import Actor, AuditLog, AuditWriteError, EventType
 from zerotrust.catalog import Catalog, CatalogItem, ItemNotInCatalog
 from zerotrust.checkout import CheckoutService
 from zerotrust.explain import first_detail, provider_order_id
 from zerotrust.faults import Fault, FaultInjector
-from zerotrust.mandate import ANY_SKU, Mandate
+from zerotrust.gateway import PurchaseGateway
+from zerotrust.idempotency import IdempotencyStore
+from zerotrust.mandate import ANY_SKU, Mandate, MandateStore
 from zerotrust.intent import ParsedIntent
-from zerotrust.policy import PolicyEngine
+from zerotrust.policy import PolicyEngine, PurchaseRequest
 
 FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
 
@@ -743,6 +748,136 @@ def create_demo_app(
             "triggers": triggers,
         }
 
+    @demo.post("/demo/audit/chain-break")
+    def chain_break_demo():
+        """Show the hash chain catching exactly what the triggers cannot.
+
+        `tamper_audit` above proves the triggers -- and refuses to run at all
+        if they are missing, which means it can never actually demonstrate a
+        broken chain: the trigger always stops the edit before the chain could
+        go inconsistent. This demonstrates the other half, honestly: it builds
+        a THROWAWAY, in-memory-equivalent copy of the log, seeded the same way
+        the real one is (through `AuditLog.record`, not raw SQL, so the chain
+        is genuine rather than staged), then drops the triggers ON THAT COPY
+        ONLY and edits a row directly -- exactly the scenario named in this
+        card's own boundary text: someone with enough database control to get
+        around the triggers.
+
+        This never touches the live audit log this session actually uses.
+        Breaking that on purpose would leave every other view of this demo
+        reporting a real, permanent BROKEN chain afterward, which would be a
+        worse kind of dishonesty than not having this button at all.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "chain_demo.db")
+            demo_log = AuditLog(db_path)
+
+            rid = f"demo_chain_{secrets.token_hex(4)}"
+            demo_log.record(EventType.PURCHASE_REQUESTED, Actor.AGENT,
+                            request_id=rid, details={"sku": "SKU-COFFEE"})
+            demo_log.record(EventType.USER_CONFIRMED, Actor.HUMAN, request_id=rid)
+            demo_log.record(EventType.POLICY_APPROVED, Actor.POLICY_ENGINE,
+                            request_id=rid, reason="all mandate rules satisfied")
+            demo_log.record(EventType.PAYMENT_CAPTURED, Actor.SYSTEM, request_id=rid)
+
+            before = demo_log.verify().as_dict()
+
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute("DROP TRIGGER IF EXISTS audit_log_no_update")
+                conn.execute(
+                    "UPDATE audit_log SET reason = 'nothing to see here' "
+                    "WHERE event_type = 'POLICY_APPROVED' AND request_id = ?",
+                    (rid,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            after = demo_log.verify().as_dict()
+
+        return {
+            "synthetic": True,
+            "note": ("Ran against a throwaway, seeded copy of the audit log, "
+                     "never this session's real one -- with that copy's own "
+                     "append-only triggers dropped, to show what the hash "
+                     "chain catches when an edit reaches the table around "
+                     "them."),
+            "tampered_field": "reason",
+            "before": before,
+            "after": after,
+        }
+
+    @demo.post("/demo/audit/write-blocks-payment")
+    def audit_write_blocks_payment_demo():
+        """Show that an unwritable audit log stops the payment, never the
+        reverse.
+
+        `gateway.py`'s whole ordering exists for this: `PAYMENT_ATTEMPTED` is
+        logged BEFORE `_execute_purchase` is ever called, so a log write that
+        fails raises `AuditWriteError` out of the gateway with the provider
+        never reached. `tests/test_audit.py::test_an_unwritable_log_blocks_the_money_action`
+        proves this in-process; this is the same proof, exposed live.
+
+        Runs against a fully throwaway stack -- its own catalog-less mandate,
+        policy engine, and idempotency store, all in temp SQLite files, torn
+        down when the request ends -- because there is no way to make the
+        REAL audit log briefly unwritable without it actually failing to log
+        real requests while it's broken.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            mandate_store = MandateStore(os.path.join(tmp_dir, "mandate.db"))
+            demo_agent = f"demo_write_block_{secrets.token_hex(4)}"
+            now = time.time()
+            mandate_store.issue(Mandate(
+                agent_id=demo_agent,
+                max_amount_paise=10_000_00,
+                allowed_skus=frozenset({ANY_SKU}),
+                expires_at=now + 3600,
+                velocity_limit=100,
+            ))
+            policy = PolicyEngine(mandate_store, db_path=os.path.join(tmp_dir, "policy.db"))
+            store = IdempotencyStore(os.path.join(tmp_dir, "idempotency.db"))
+
+            provider_calls: list = []
+
+            class UnwritableAuditLog(AuditLog):
+                """Accepts nothing -- every `record()` fails, on purpose."""
+
+                def record(self, *args, **kwargs):
+                    raise AuditWriteError(
+                        "simulated disk failure: the audit log cannot be written")
+
+            broken_audit = UnwritableAuditLog(os.path.join(tmp_dir, "audit.db"))
+            gateway = PurchaseGateway(
+                policy, store,
+                execute_purchase=lambda r: provider_calls.append(r) or {"order_id": "demo"},
+                audit=broken_audit,
+            )
+
+            request = PurchaseRequest(
+                agent_id=demo_agent, sku="SKU-DEMO", amount_paise=50_00,
+                idempotency_key=f"demo_key_{secrets.token_hex(4)}",
+            )
+
+            try:
+                gateway.submit(request)
+                raised = None
+            except AuditWriteError as exc:
+                raised = str(exc)
+
+        return {
+            "synthetic": True,
+            "note": ("Ran against a fully throwaway stack -- its own mandate, "
+                     "policy engine and idempotency store, never this "
+                     "session's real ones -- with an audit log rigged to fail "
+                     "every write, to show what the gateway does when it "
+                     "cannot log."),
+            "raised": raised,
+            "blocked": raised is not None,
+            "provider_calls": len(provider_calls),
+        }
+
     @demo.post("/demo/agent")
     def fresh_agent():
         """Issue a throwaway agent with its own mandate.
@@ -1019,6 +1154,38 @@ def create_demo_app(
                         "head_hash": (chain.head or "—")[:16],
                         "triggers": triggers,
                         "guarantee_present": len(triggers) >= 2,
+                    },
+                },
+                {
+                    "id": "audit_before_payment",
+                    "title": "The audit write happens before the money moves",
+                    "mechanism": (
+                        "PAYMENT_ATTEMPTED is logged before the provider is "
+                        "ever called; a log write that fails raises and the "
+                        "purchase never executes"
+                    ),
+                    # The trade this makes, stated rather than left implicit:
+                    # logging first can leave an INTENT logged whose outcome
+                    # is then unknown if the process dies between the two
+                    # writes. That gap is real -- Phase 7's reconciliation
+                    # exists specifically to close it -- and it is strictly
+                    # better than the alternative failure, where money moves
+                    # and nothing records that it did.
+                    "boundary": (
+                        "This is an ordering guarantee, not a durability one: "
+                        "it stops a payment from executing with no record, "
+                        "not a crash between the audit write succeeding and "
+                        "the provider call landing. That gap is real and is "
+                        "what 'Unknown outcomes stay unknown' and the "
+                        "reconciliation sweep exist to close."
+                    ),
+                    "evidence": {
+                        "payment_attempted_logged": audit.count_of(
+                            EventType.PAYMENT_ATTEMPTED),
+                        "payment_captured": audit.count_of(
+                            EventType.PAYMENT_CAPTURED),
+                        "payment_pending_verification": audit.count_of(
+                            EventType.PAYMENT_PENDING_VERIFICATION),
                     },
                 },
                 {

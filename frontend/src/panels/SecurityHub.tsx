@@ -14,6 +14,7 @@ import { CiphertextReveal } from "@/components/hub/CiphertextReveal"
 import { KillSwitch } from "@/components/hub/KillSwitch"
 import { WebhookVerification } from "@/components/hub/WebhookVerification"
 import { AdminAuthProbe } from "@/components/hub/AdminAuthProbe"
+import { AuditWriteBlocksPayment } from "@/components/hub/AuditWriteBlocksPayment"
 import { cn } from "@/lib/utils"
 
 type DemoProps = { freshAgent: () => Promise<string>; onChanged?: () => void }
@@ -32,6 +33,7 @@ const DEMONSTRATIONS: Record<string, React.ComponentType<DemoProps>> = {
   mandate: MandateOverride,
   confirmation: VelocityBurst,
   append_only_audit: TamperTimeline,
+  audit_before_payment: AuditWriteBlocksPayment,
   webhook_verification: WebhookVerification,
   admin_auth: AdminAuthProbe,
   price_revalidation: PriceSwap,

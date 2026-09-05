@@ -142,6 +142,8 @@ export const api = {
     adminPost(`/demo/catalog/${sku}`, changes),
   deleteItem: (sku: string) => adminDelete(`/demo/catalog/${sku}`),
   tamper: () => post("/demo/tamper-audit"),
+  chainBreakDemo: () => post("/demo/audit/chain-break"),
+  auditWriteBlocksPaymentDemo: () => post("/demo/audit/write-blocks-payment"),
   armTimeout: () => post("/demo/fault/timeout"),
   compromiseParser: (enabled: boolean) =>
     post(`/demo/parser/compromise?enabled=${enabled}`),

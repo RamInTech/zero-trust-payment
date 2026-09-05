@@ -1,6 +1,6 @@
 import { useState } from "react"
 import { motion } from "framer-motion"
-import { Ban, ShieldCheck, Zap } from "lucide-react"
+import { Ban, ShieldCheck, Unlink, Zap } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { api } from "@/api"
 import { cn } from "@/lib/utils"
@@ -77,6 +77,69 @@ export function TamperTimeline({ onChanged }: { onChanged?: () => void } = {}) {
           <span className="text-faint">→</span>
           <span className="font-medium text-ok">{after} entries after</span>
           <span className="text-faint">— unchanged</span>
+        </motion.p>
+      )}
+
+      <ChainBreak />
+    </div>
+  )
+}
+
+/**
+ * The other half of this card's claim: what the triggers above CANNOT catch.
+ *
+ * The attack above proves the triggers -- and refuses to run at all if they
+ * are missing, so it can never show a broken chain: the trigger always stops
+ * the edit before the chain would need to. This runs against a throwaway
+ * copy of the log instead, seeded through the real `AuditLog.record` so the
+ * chain is genuine, then drops that copy's own triggers and edits a row
+ * directly -- exactly the scenario this card's own boundary text names:
+ * someone with enough database control to get around them. It never touches
+ * the live audit log this session actually uses.
+ */
+function ChainBreak() {
+  const [stage, setStage] = useState<"idle" | "before" | "broken">("idle")
+  const [before, setBefore] = useState<any>(null)
+  const [after, setAfter] = useState<any>(null)
+  const [busy, setBusy] = useState(false)
+
+  async function run() {
+    setBusy(true); setStage("idle"); setBefore(null); setAfter(null)
+    const res = await api.chainBreakDemo()
+    if (!res.ok) { setBusy(false); return }
+    setBefore(res.body.before)
+    setStage("before")
+    await new Promise(r => setTimeout(r, 700))
+    setAfter(res.body.after)
+    setStage("broken")
+    setBusy(false)
+  }
+
+  return (
+    <div className="mt-3.5 border-t border-border pt-3">
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <p className="text-2xs text-faint">
+          On a throwaway, seeded copy: drops <em>that copy's</em> own triggers,
+          then edits a row directly — the one path the triggers alone cannot
+          cover.
+        </p>
+        <Button size="sm" variant="outline" onClick={run} disabled={busy}>
+          <Unlink className="h-3.5 w-3.5" aria-hidden="true" />
+          {busy ? "Breaking…" : "Watch the chain break"}
+        </Button>
+      </div>
+
+      {before && (
+        <p className="mono flex items-center gap-1.5 text-2xs text-ok">
+          <ShieldCheck className="h-3.5 w-3.5" aria-hidden="true" />
+          before: {before.summary}
+        </p>
+      )}
+      {stage === "broken" && after && (
+        <motion.p initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }}
+                  className="mono mt-1.5 flex items-center gap-1.5 text-2xs text-danger">
+          <Ban className="h-3.5 w-3.5" aria-hidden="true" />
+          after: {after.summary}
         </motion.p>
       )}
     </div>
