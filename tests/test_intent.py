@@ -307,6 +307,105 @@ def test_empty_request_asks_for_clarification(catalog):
     assert RuleBasedIntentParser(catalog).parse("").needs_clarification
 
 
+def test_rule_based_match_kinds_are_classified(catalog):
+    """Every clarification the deterministic parser produces is classified.
+
+    The frontend only shows "not stocked -- add it to the catalog" for
+    match_kind "no_match". Getting this wrong here means that offer would
+    render for an empty message or a genuine ambiguity, neither of which it
+    makes sense for.
+    """
+    parser = RuleBasedIntentParser(catalog)
+    assert parser.parse("").notes["match_kind"] == "off_topic"
+    assert parser.parse("buy a spaceship").notes["match_kind"] == "no_match"
+    assert parser.parse("coffee or tea?").notes["match_kind"] == "ambiguous"
+
+
+def test_an_llm_parsers_match_kind_is_read_from_the_model(catalog):
+    """The model itself classifies why -- only it has the world knowledge to
+    tell a real-but-unstocked product apart from a question or an injection."""
+    for kind in ("ambiguous", "no_match", "off_topic"):
+        intent = claude_with({
+            "items": [], "understood": False,
+            "clarification": "irrelevant to this test",
+            "match_kind": kind,
+        }, catalog).parse("anything")
+        assert intent.notes["match_kind"] == kind
+
+
+def test_an_invalid_match_kind_from_the_model_is_discarded_not_trusted(catalog):
+    """A model can say anything; only the three known values are believed.
+
+    Defaulting an unrecognised value to None (rather than passing it through,
+    or guessing "no_match") is the safe direction: showing the stock-offer
+    when we are not sure is the exact mistake this classification exists to
+    prevent.
+    """
+    intent = claude_with({
+        "items": [], "understood": False, "clarification": "hm",
+        "match_kind": "definitely_a_yacht",
+    }, catalog).parse("buy a yacht")
+    assert intent.notes["match_kind"] is None
+
+
+def test_a_model_that_omits_match_kind_gets_none_not_a_crash(catalog):
+    """Older stubs and a model that ignores the new schema field must not
+    break -- `.get()` over the payload, not a required key."""
+    intent = claude_with({
+        "items": [], "understood": False, "clarification": "hm",
+    }, catalog).parse("buy a yacht")
+    assert intent.notes["match_kind"] is None
+
+
+def test_a_generic_category_word_asks_which_variant_is_meant(catalog):
+    """"Buy a juice" must not silently pick whichever juice sorts first.
+
+    The catalog carries three juices precisely so this is a real ambiguity,
+    not a hypothetical one -- a customer who names no flavour has not told the
+    agent which product they want, and the agent choosing on their behalf is
+    the same failure mode as any other guessed SKU.
+    """
+    intent = RuleBasedIntentParser(catalog).parse("buy a juice")
+    assert intent.needs_clarification
+    assert "SKU-JUICE-APPLE" in intent.clarification
+    assert "SKU-JUICE-MIXED" in intent.clarification
+    assert "SKU-JUICE-ORANGE" in intent.clarification
+
+
+def test_naming_the_flavour_resolves_without_asking(catalog):
+    """The fix above must not make every juice request ambiguous.
+
+    A shared word ("juice") sitting in all three names previously meant that
+    scoring by mere presence would tie every juice item together even when the
+    customer had already said which one they wanted. Scoring by how many
+    distinct words actually matched is what lets "orange" break the tie.
+    """
+    for text, sku in [
+        ("buy orange juice", "SKU-JUICE-ORANGE"),
+        ("buy apple juice", "SKU-JUICE-APPLE"),
+        ("get me some mixed fruit juice", "SKU-JUICE-MIXED"),
+    ]:
+        intent = RuleBasedIntentParser(catalog).parse(text)
+        assert not intent.needs_clarification, (text, intent.clarification)
+        assert intent.sku == sku, (text, intent.sku)
+
+
+def test_a_sku_that_encodes_its_own_name_does_not_get_a_bonus(catalog):
+    """SKU-COFFEE contains the word "coffee"; that must not outweigh SKU-TEA.
+
+    Scoring by a plain word COUNT (rather than the set of distinct words
+    matched) let SKU-COFFEE match "coffee" twice -- once as a catalog keyword,
+    once as a word extracted from its own SKU -- and out-score SKU-TEA, whose
+    id ("SKU-TEA") happens to share no letters with its display name ("Masala
+    Chai"). That made an already-covered case (test_ambiguous_request_is_not_
+    guessed) regress the moment scoring was introduced for the juice fix.
+    """
+    intent = RuleBasedIntentParser(catalog).parse("coffee or tea?")
+    assert intent.needs_clarification
+    assert "SKU-COFFEE" in intent.clarification
+    assert "SKU-TEA" in intent.clarification
+
+
 # -- the real API, when a key is available --------------------------------
 
 live_llm = pytest.mark.skipif(
@@ -503,6 +602,48 @@ def test_live_groq_asks_rather_than_guessing(groq_parser):
     intent = groq_parser.parse("buy the cheaper one")
     assert intent.needs_clarification
     print(f"\n  [live-groq] ambiguous -> {intent.clarification}")
+
+
+@live_groq
+def test_live_groq_asks_which_juice_rather_than_defaulting(groq_parser):
+    """The regression this project actually hit: a real model, not just the
+    deterministic parser, silently picking Orange Juice for a bare "juice"."""
+    intent = groq_parser.parse("buy a juice")
+    assert intent.needs_clarification, (
+        "the live model picked a flavour instead of asking: "
+        f"sku={intent.sku!r} clarification={intent.clarification!r}"
+    )
+    print(f"\n  [live-groq] ambiguous -> {intent.clarification}")
+
+
+@live_groq
+def test_live_groq_classifies_a_history_question_as_off_topic(groq_parser):
+    """The exact case reported: "why is the last purchase denied" is not a
+    purchase request, and must not be classified as one the catalog lacks.
+
+    The model's reply text already correctly explained it has no access to
+    transaction history -- the bug this pins is one turn downstream, in
+    whether the classification lets the frontend show "not stocked, add it
+    to the catalog" underneath that reply. It must not.
+    """
+    intent = groq_parser.parse("why is the last purchase denied")
+    assert intent.needs_clarification
+    assert intent.notes.get("match_kind") == "off_topic", (
+        f"expected off_topic, got {intent.notes.get('match_kind')!r} -- "
+        f"clarification was: {intent.clarification!r}"
+    )
+    print(f"\n  [live-groq] off_topic -> {intent.clarification}")
+
+
+@live_groq
+def test_live_groq_classifies_a_real_but_unstocked_item_as_no_match(groq_parser):
+    """The one case where "add it to the catalog" is the right thing to offer."""
+    intent = groq_parser.parse("buy me a yacht")
+    assert intent.needs_clarification
+    assert intent.notes.get("match_kind") == "no_match", (
+        f"expected no_match, got {intent.notes.get('match_kind')!r}"
+    )
+    print(f"\n  [live-groq] no_match -> {intent.clarification}")
 
 
 @live_groq

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from zerotrust.audit import Actor, EventType
@@ -28,6 +28,7 @@ from zerotrust.e2e import SealedText
 from zerotrust.explain import UnknownRequest, explain
 from zerotrust.narrate import ExplanationWriter
 from zerotrust.provider import ProviderTimeout
+from zerotrust.webhook import SIGNATURE_HEADER, WebhookReceiver
 from zerotrust.recommend import Recommender
 
 _CODE_STATUS = {
@@ -80,6 +81,7 @@ def create_app(
     checkout: CheckoutService,
     narrator: Optional[ExplanationWriter] = None,
     recommender: Optional[Recommender] = None,
+    webhooks: Optional[WebhookReceiver] = None,
 ) -> FastAPI:
     app = FastAPI(
         title="Zero-Trust Payment Authorization for AI Agents",
@@ -91,9 +93,12 @@ def create_app(
     )
 
     def _fail(exc: CheckoutError):
+        detail = {"code": exc.code, "reason": exc.reason}
+        if exc.match_kind is not None:
+            detail["match_kind"] = exc.match_kind
         raise HTTPException(
             status_code=_CODE_STATUS.get(exc.code, 400),
-            detail={"code": exc.code, "reason": exc.reason},
+            detail=detail,
         )
 
     @app.get("/catalog")
@@ -290,5 +295,31 @@ def create_app(
                 for e in entries
             ],
         }
+
+    @app.post("/webhooks/razorpay")
+    async def razorpay_webhook(request: Request, response: Response):
+        """Receive a provider webhook, verify its signature, and reconcile.
+
+        The body is read as RAW BYTES and never re-serialised: the HMAC covers
+        the exact octets Razorpay signed, and round-tripping through JSON
+        changes key order and whitespace enough to break every genuine
+        delivery.
+
+        A verified delivery triggers a reconciliation -- a check against the
+        provider's API -- and nothing else. It cannot mark a payment captured,
+        release a velocity slot, or write any outcome, because a signature
+        proves who sent a message and not that its contents are true.
+
+        Rejections return 401 rather than 400: this is a failure to
+        authenticate, and Razorpay treats a non-2xx as a delivery to retry.
+        """
+        if webhooks is None:
+            raise HTTPException(status_code=501,
+                                detail="no webhook receiver configured")
+        body = await request.body()
+        result = webhooks.receive(body, request.headers.get(SIGNATURE_HEADER))
+        if not result.accepted:
+            response.status_code = 401
+        return result.as_dict()
 
     return app

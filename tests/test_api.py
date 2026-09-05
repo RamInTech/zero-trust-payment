@@ -110,6 +110,19 @@ def test_ambiguous_text_is_422(env):
     assert r.json()["detail"]["code"] == "NEEDS_CLARIFICATION"
 
 
+def test_the_response_carries_match_kind_so_the_client_can_tell_why(env):
+    """This is the field the chat UI reads to decide whether "add it to the
+    catalog" belongs on screen at all -- it must survive the trip over HTTP,
+    not just exist on the Python exception."""
+    ambiguous = env["client"].post(
+        "/intents", json={"agent_id": AGENT, "text": "coffee or tea?"})
+    assert ambiguous.json()["detail"]["match_kind"] == "ambiguous"
+
+    no_match = env["client"].post(
+        "/intents", json={"agent_id": AGENT, "text": "buy me a yacht"})
+    assert no_match.json()["detail"]["match_kind"] == "no_match"
+
+
 def test_decline_halts_everything(env):
     client = env["client"]
     pending = client.post("/purchase-intents",

@@ -54,10 +54,16 @@ class PendingStatus(str, Enum):
 class CheckoutError(RuntimeError):
     """A request could not proceed. Carries a specific, structured reason."""
 
-    def __init__(self, reason: str, code: str) -> None:
+    def __init__(self, reason: str, code: str,
+                 match_kind: Optional[str] = None) -> None:
         super().__init__(reason)
         self.reason = reason
         self.code = code
+        #: For NEEDS_CLARIFICATION only -- why the parser could not proceed
+        #: ("ambiguous" / "no_match" / "off_topic"), so the client can tell
+        #: "several real items could be meant" apart from "this was never a
+        #: purchase request" instead of treating every failed parse the same.
+        self.match_kind = match_kind
 
 
 @dataclass
@@ -261,6 +267,7 @@ class CheckoutService:
             raise CheckoutError(
                 intent.clarification or "could not understand the request",
                 code="NEEDS_CLARIFICATION",
+                match_kind=intent.notes.get("match_kind"),
             )
 
         return self.propose(agent_id, intent.sku, intent.quantity, parsed=intent,
@@ -300,6 +307,7 @@ class CheckoutService:
             raise CheckoutError(
                 intent.clarification or "could not understand the request",
                 code="NEEDS_CLARIFICATION",
+                match_kind=intent.notes.get("match_kind"),
             )
 
         pendings: list[PendingPurchase] = []

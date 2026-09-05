@@ -171,6 +171,27 @@ def test_request_for_a_nonexistent_item_asks_rather_than_guessing(checkout, mand
     assert exc.value.code == "NEEDS_CLARIFICATION"
 
 
+def test_the_clarifications_match_kind_reaches_the_checkout_error(checkout, mandate):
+    """The classification is not lost between the parser and the caller.
+
+    `CheckoutService` is the seam where a future non-text entry point (a
+    voice frontend, say) would also raise CheckoutError -- if match_kind only
+    lived on ParsedIntent, every such caller would have to know to go dig it
+    out of the parser's return value itself rather than reading the error.
+    """
+    with pytest.raises(CheckoutError) as ambiguous:
+        checkout.propose_from_text(AGENT, "coffee or tea?")
+    assert ambiguous.value.match_kind == "ambiguous"
+
+    with pytest.raises(CheckoutError) as no_match:
+        checkout.propose_from_text(AGENT, "buy me a yacht")
+    assert no_match.value.match_kind == "no_match"
+
+    with pytest.raises(CheckoutError) as off_topic:
+        checkout.propose_from_text(AGENT, "")
+    assert off_topic.value.match_kind == "off_topic"
+
+
 # -- 4. declining halts everything ----------------------------------------
 
 def test_declining_halts_the_flow_entirely(checkout, audit, engine, mandate):
