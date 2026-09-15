@@ -13,20 +13,25 @@ putting 4 through a cap of 3. Read-then-act is unsafe under concurrency, which
 is exactly the lesson of Phase 1.
 
 So a velocity slot is CLAIMED, not counted: the count and the insert happen in
-one BEGIN IMMEDIATE transaction, and SQLite serialises writers. And the claim
-table carries UNIQUE(agent_id, idempotency_key), so a retry of an existing
-request reuses its own slot instead of consuming a second one -- the same
+one transaction holding a lock on that agent's budget. And the claim table
+carries UNIQUE(agent_id, idempotency_key), so a retry of an existing request
+reuses its own slot instead of consuming a second one -- the same
 unique-constraint trick Phase 1 uses, applied one level up.
+
+Phase 10 (Postgres): SQLite serialised every writer to the file, and the claim
+leaned on that. Postgres does not, so the claim takes an advisory lock named
+after the agent. Two agents no longer wait for each other; two requests from
+the same agent still cannot both read the count before either inserts.
 """
 
 from __future__ import annotations
 
-import sqlite3
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Optional
 
+from zerotrust.db import Database
 from zerotrust.mandate import Mandate, MandateStore
 
 # Slot lifecycle.
@@ -85,14 +90,14 @@ class Decision:
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS velocity_slots (
-    slot_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    slot_id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     agent_id        TEXT NOT NULL,
     mandate_id      TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
     sku             TEXT NOT NULL,
-    amount_paise    INTEGER NOT NULL,
+    amount_paise    BIGINT NOT NULL,
     status          TEXT NOT NULL,
-    claimed_at      REAL NOT NULL,
+    claimed_at      DOUBLE PRECISION NOT NULL,
     -- one slot per request, so a retry cannot consume a second one
     UNIQUE (agent_id, idempotency_key)
 );
@@ -100,10 +105,10 @@ CREATE INDEX IF NOT EXISTS idx_slots_agent_time
     ON velocity_slots(agent_id, claimed_at);
 
 CREATE TABLE IF NOT EXISTS denials (
-    denial_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    denial_id  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     agent_id   TEXT NOT NULL,
     rule       TEXT NOT NULL,
-    denied_at  REAL NOT NULL
+    denied_at  DOUBLE PRECISION NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_denials_agent_time
     ON denials(agent_id, denied_at);
@@ -114,23 +119,13 @@ class PolicyEngine:
     def __init__(
         self,
         mandate_store: MandateStore,
-        db_path: Optional[str] = None,
+        db: Optional[Database] = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.mandates = mandate_store
-        self.db_path = db_path or mandate_store.db_path
+        self.db = db or mandate_store.db
         self._clock = clock
-        conn = self._connect()
-        try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.executescript(_SCHEMA)
-        finally:
-            conn.close()
-
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=30.0, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        return conn
+        self.db.apply_schema(_SCHEMA)
 
     # -- the checks --------------------------------------------------------
 
@@ -258,19 +253,17 @@ class PolicyEngine:
         self, request: PurchaseRequest, mandate: Mandate, now: float
     ) -> Decision:
         window_start = now - mandate.velocity_window_secs
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
+        with self.db.transaction() as conn:
+            self.db.lock(conn, f"velocity:{request.agent_id}")
 
             existing = conn.execute(
-                "SELECT * FROM velocity_slots WHERE agent_id = ? AND "
-                "idempotency_key = ?",
+                "SELECT * FROM velocity_slots WHERE agent_id = %s AND "
+                "idempotency_key = %s",
                 (request.agent_id, request.idempotency_key),
             ).fetchone()
             if existing is not None:
                 # A retry of a request that already holds a slot. Reusing it is
                 # what stops retries from eating the agent's velocity budget.
-                conn.execute("COMMIT")
                 return Decision(
                     approved=True,
                     request=request,
@@ -282,53 +275,54 @@ class PolicyEngine:
                 )
 
             used = conn.execute(
-                "SELECT COUNT(*) AS n FROM velocity_slots WHERE agent_id = ? "
-                "AND status IN (?, ?) AND claimed_at >= ?",
+                "SELECT COUNT(*) AS n FROM velocity_slots WHERE agent_id = %s "
+                "AND status IN (%s, %s) AND claimed_at >= %s",
                 (request.agent_id, SLOT_HELD, SLOT_CONFIRMED, window_start),
             ).fetchone()["n"]
 
-            if used >= mandate.velocity_limit:
-                conn.execute("COMMIT")
-                window_mins = mandate.velocity_window_secs / 60
-                return self._deny(
-                    request,
-                    Rule.VELOCITY_EXCEEDED,
-                    f"velocity limit reached: {used} of {mandate.velocity_limit} "
-                    f"purchases already made in the last "
-                    f"{window_mins:.0f} minute(s)",
-                    mandate_id=mandate.mandate_id,
-                    used=used,
-                    limit=mandate.velocity_limit,
-                    window_secs=mandate.velocity_window_secs,
+            over_limit = used >= mandate.velocity_limit
+            if not over_limit:
+                conn.execute(
+                    "INSERT INTO velocity_slots (agent_id, mandate_id, "
+                    "idempotency_key, sku, amount_paise, status, claimed_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        request.agent_id,
+                        mandate.mandate_id,
+                        request.idempotency_key,
+                        request.sku,
+                        request.amount_paise,
+                        SLOT_HELD,
+                        now,
+                    ),
                 )
 
-            conn.execute(
-                "INSERT INTO velocity_slots (agent_id, mandate_id, "
-                "idempotency_key, sku, amount_paise, status, claimed_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    request.agent_id,
-                    mandate.mandate_id,
-                    request.idempotency_key,
-                    request.sku,
-                    request.amount_paise,
-                    SLOT_HELD,
-                    now,
-                ),
-            )
-            conn.execute("COMMIT")
-            return Decision(
-                approved=True,
-                request=request,
+        if over_limit:
+            # Recorded after the lock is released: a denial needs no hold on
+            # the budget, and taking a second connection while holding the
+            # lock would make every refusal wait on the pool.
+            window_mins = mandate.velocity_window_secs / 60
+            return self._deny(
+                request,
+                Rule.VELOCITY_EXCEEDED,
+                f"velocity limit reached: {used} of {mandate.velocity_limit} "
+                f"purchases already made in the last "
+                f"{window_mins:.0f} minute(s)",
                 mandate_id=mandate.mandate_id,
-                details={
-                    "velocity_slot": "claimed",
-                    "used_before": used,
-                    "limit": mandate.velocity_limit,
-                },
+                used=used,
+                limit=mandate.velocity_limit,
+                window_secs=mandate.velocity_window_secs,
             )
-        finally:
-            conn.close()
+        return Decision(
+            approved=True,
+            request=request,
+            mandate_id=mandate.mandate_id,
+            details={
+                "velocity_slot": "claimed",
+                "used_before": used,
+                "limit": mandate.velocity_limit,
+            },
+        )
 
     def confirm_slot(self, agent_id: str, idempotency_key: str) -> None:
         self._set_slot_status(agent_id, idempotency_key, SLOT_CONFIRMED)
@@ -338,49 +332,36 @@ class PolicyEngine:
         self._set_slot_status(agent_id, idempotency_key, SLOT_RELEASED)
 
     def _set_slot_status(self, agent_id: str, key: str, status: str) -> None:
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
+        with self.db.connection() as conn:
             conn.execute(
-                "UPDATE velocity_slots SET status = ? WHERE agent_id = ? "
-                "AND idempotency_key = ?",
+                "UPDATE velocity_slots SET status = %s WHERE agent_id = %s "
+                "AND idempotency_key = %s",
                 (status, agent_id, key),
             )
-            conn.execute("COMMIT")
-        finally:
-            conn.close()
 
     def slots_used(self, agent_id: str, window_secs: float) -> int:
-        conn = self._connect()
-        try:
+        with self.db.connection() as conn:
             return conn.execute(
-                "SELECT COUNT(*) AS n FROM velocity_slots WHERE agent_id = ? "
-                "AND status IN (?, ?) AND claimed_at >= ?",
+                "SELECT COUNT(*) AS n FROM velocity_slots WHERE agent_id = %s "
+                "AND status IN (%s, %s) AND claimed_at >= %s",
                 (agent_id, SLOT_HELD, SLOT_CONFIRMED, self._clock() - window_secs),
             ).fetchone()["n"]
-        finally:
-            conn.close()
 
     # -- helper ------------------------------------------------------------
 
     def _record_denial(self, agent_id: str, rule: Rule) -> None:
         """Remember a denial, for the cool-down count.
 
-        Kept in the policy engine's own database rather than read back out of
+        Kept in the policy engine's own tables rather than read back out of
         the audit log: the engine knows nothing about the audit log today, and
         coupling it to one so it can rate-limit would be a strange dependency
         for a component whose job is to decide, not to remember.
         """
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
+        with self.db.connection() as conn:
             conn.execute(
-                "INSERT INTO denials (agent_id, rule, denied_at) VALUES (?, ?, ?)",
+                "INSERT INTO denials (agent_id, rule, denied_at) VALUES (%s, %s, %s)",
                 (agent_id, rule.value, self._clock()),
             )
-            conn.execute("COMMIT")
-        finally:
-            conn.close()
 
     def denials_in_window(self, agent_id: str, window_secs: float) -> int:
         """Denials that count toward the cool-down.
@@ -390,16 +371,13 @@ class PolicyEngine:
         the window, so an agent that hit the threshold once could never leave
         it -- a permanent ban wearing a rate limit's clothes.
         """
-        conn = self._connect()
-        try:
+        with self.db.connection() as conn:
             return conn.execute(
-                "SELECT COUNT(*) AS n FROM denials WHERE agent_id = ? "
-                "AND rule != ? AND denied_at >= ?",
+                "SELECT COUNT(*) AS n FROM denials WHERE agent_id = %s "
+                "AND rule != %s AND denied_at >= %s",
                 (agent_id, Rule.COOLDOWN_ACTIVE.value,
                  self._clock() - window_secs),
             ).fetchone()["n"]
-        finally:
-            conn.close()
 
     def _check_cooldown(
         self, request: PurchaseRequest, mandate: Mandate, now: float
@@ -411,16 +389,13 @@ class PolicyEngine:
         if used < mandate.cooldown_denials:
             return None
 
-        conn = self._connect()
-        try:
+        with self.db.connection() as conn:
             row = conn.execute(
-                "SELECT MIN(denied_at) AS oldest FROM denials WHERE agent_id = ? "
-                "AND rule != ? AND denied_at >= ?",
+                "SELECT MIN(denied_at) AS oldest FROM denials WHERE agent_id = %s "
+                "AND rule != %s AND denied_at >= %s",
                 (request.agent_id, Rule.COOLDOWN_ACTIVE.value,
                  now - mandate.cooldown_window_secs),
             ).fetchone()
-        finally:
-            conn.close()
         oldest = row["oldest"] if row and row["oldest"] else now
         retry_after = max(0.0, (oldest + mandate.cooldown_window_secs) - now)
 

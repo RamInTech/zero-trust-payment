@@ -41,8 +41,8 @@ def clock():
 
 
 @pytest.fixture
-def engine(tmp_path, clock):
-    store = MandateStore(str(tmp_path / "policy.db"), clock=clock)
+def engine(db, clock):
+    store = MandateStore(db, clock=clock)
     return PolicyEngine(store, clock=clock)
 
 
@@ -74,10 +74,10 @@ def req(**overrides) -> PurchaseRequest:
 
 
 @pytest.fixture
-def gateway(engine, tmp_path):
+def gateway(engine):
     """Gateway with a recording executor, so denials are provably inert."""
     calls: list[PurchaseRequest] = []
-    store = IdempotencyStore(str(tmp_path / "idem.db"))
+    store = IdempotencyStore(engine.db)
 
     def execute(request: PurchaseRequest) -> dict:
         calls.append(request)
@@ -229,9 +229,9 @@ def test_retries_do_not_consume_extra_velocity_budget(gateway, mandate):
     assert len(gateway.calls) == 3
 
 
-def test_a_failed_execution_releases_its_velocity_slot(engine, tmp_path, mandate):
+def test_a_failed_execution_releases_its_velocity_slot(engine, mandate):
     """A failure shouldn't quietly cost the agent budget."""
-    store = IdempotencyStore(str(tmp_path / "idem.db"))
+    store = IdempotencyStore(engine.db)
     calls = {"n": 0}
 
     def flaky(request):
@@ -305,7 +305,7 @@ def test_revoked_mandate_denies_further_purchases(gateway, engine, mandate):
     assert len(gateway.calls) == 1
 
 
-def test_mandates_are_isolated_between_agents(engine, clock, tmp_path):
+def test_mandates_are_isolated_between_agents(engine, clock):
     engine.mandates.issue(
         Mandate(
             agent_id="agent_rich",
@@ -340,14 +340,15 @@ def test_mandates_are_isolated_between_agents(engine, clock, tmp_path):
 # -- concurrency: a burst must not overshoot the cap ----------------------
 
 @pytest.mark.parametrize("run", range(10))
-def test_concurrent_burst_cannot_exceed_the_velocity_limit(tmp_path, run):
+def test_concurrent_burst_cannot_exceed_the_velocity_limit(db, run):
     """Read-then-act would let N threads all see 'budget available'.
 
-    The slot is claimed inside one BEGIN IMMEDIATE transaction, so SQLite
-    serialises the claimants and exactly `velocity_limit` win.
+    The slot is claimed inside one transaction holding an advisory lock on the
+    agent's budget, so Postgres serialises the claimants and exactly
+    `velocity_limit` win.
     """
     clock = FakeClock()
-    mandate_store = MandateStore(str(tmp_path / f"p{run}.db"), clock=clock)
+    mandate_store = MandateStore(db, clock=clock)
     engine = PolicyEngine(mandate_store, clock=clock)
     mandate_store.issue(
         Mandate(

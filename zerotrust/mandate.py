@@ -14,8 +14,8 @@ Schema decisions (previously open item #1 in RAZORPAY.md):
   - Velocity is a SLIDING window ("N in the last W seconds"), not a fixed one.
     A fixed window lets an agent spend 2x the cap by straddling the boundary,
     which Phase 6's adversarial suite would legitimately exploit.
-  - Mandates live in SQLite alongside the idempotency store, because velocity
-    counting needs durable purchase history anyway.
+  - Mandates live in the same database as the velocity slots, because
+    velocity counting needs durable purchase history anyway.
   - The cool-down (repeated-denial throttling) is configured HERE rather than
     on the engine, because every other per-agent boundary already lives on the
     mandate. A merchant tunes one object, and one abusive agent's threshold
@@ -25,26 +25,27 @@ Schema decisions (previously open item #1 in RAZORPAY.md):
 from __future__ import annotations
 
 import json
-import sqlite3
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from zerotrust.db import Database
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS mandates (
     mandate_id            TEXT PRIMARY KEY,
     agent_id              TEXT NOT NULL,
-    max_amount_paise      INTEGER NOT NULL,
+    max_amount_paise      BIGINT NOT NULL,
     allowed_skus          TEXT NOT NULL,      -- JSON array
     currency              TEXT NOT NULL DEFAULT 'INR',
-    expires_at            REAL NOT NULL,
+    expires_at            DOUBLE PRECISION NOT NULL,
     velocity_limit        INTEGER NOT NULL,
-    velocity_window_secs  REAL NOT NULL,
+    velocity_window_secs  DOUBLE PRECISION NOT NULL,
     cooldown_denials      INTEGER NOT NULL DEFAULT 5,
-    cooldown_window_secs  REAL NOT NULL DEFAULT 300.0,
-    created_at            REAL NOT NULL,
-    revoked_at            REAL
+    cooldown_window_secs  DOUBLE PRECISION NOT NULL DEFAULT 300.0,
+    created_at            DOUBLE PRECISION NOT NULL,
+    revoked_at            DOUBLE PRECISION
 );
 CREATE INDEX IF NOT EXISTS idx_mandates_agent ON mandates(agent_id);
 """
@@ -94,31 +95,19 @@ class Mandate:
 
 
 class MandateStore:
-    def __init__(self, db_path: str, clock: Callable[[], float] = time.time) -> None:
-        self.db_path = db_path
+    def __init__(self, db: Database, clock: Callable[[], float] = time.time) -> None:
+        self.db = db
         self._clock = clock
-        conn = self._connect()
-        try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.executescript(_SCHEMA)
-        finally:
-            conn.close()
-
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=30.0, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        return conn
+        db.apply_schema(_SCHEMA)
 
     def issue(self, mandate: Mandate) -> Mandate:
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
+        with self.db.connection() as conn:
             conn.execute(
                 "INSERT INTO mandates (mandate_id, agent_id, max_amount_paise, "
                 "allowed_skus, currency, expires_at, velocity_limit, "
                 "velocity_window_secs, cooldown_denials, cooldown_window_secs, "
                 "created_at, revoked_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (
                     mandate.mandate_id,
                     mandate.agent_id,
@@ -134,31 +123,20 @@ class MandateStore:
                     mandate.revoked_at,
                 ),
             )
-            conn.execute("COMMIT")
-        finally:
-            conn.close()
         return mandate
 
     def revoke(self, mandate_id: str) -> None:
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
+        with self.db.connection() as conn:
             conn.execute(
-                "UPDATE mandates SET revoked_at = ? WHERE mandate_id = ?",
+                "UPDATE mandates SET revoked_at = %s WHERE mandate_id = %s",
                 (self._clock(), mandate_id),
             )
-            conn.execute("COMMIT")
-        finally:
-            conn.close()
 
     def get(self, mandate_id: str) -> Optional[Mandate]:
-        conn = self._connect()
-        try:
+        with self.db.connection() as conn:
             row = conn.execute(
-                "SELECT * FROM mandates WHERE mandate_id = ?", (mandate_id,)
+                "SELECT * FROM mandates WHERE mandate_id = %s", (mandate_id,)
             ).fetchone()
-        finally:
-            conn.close()
         return _row_to_mandate(row) if row else None
 
     def active_for_agent(self, agent_id: str) -> Optional[Mandate]:
@@ -169,15 +147,12 @@ class MandateStore:
         engine reporting the agent has no mandate at all -- a specific reason
         beats a generic one (see CLAUDE.md invariants).
         """
-        conn = self._connect()
-        try:
+        with self.db.connection() as conn:
             row = conn.execute(
-                "SELECT * FROM mandates WHERE agent_id = ? AND revoked_at IS NULL "
+                "SELECT * FROM mandates WHERE agent_id = %s AND revoked_at IS NULL "
                 "ORDER BY created_at DESC LIMIT 1",
                 (agent_id,),
             ).fetchone()
-        finally:
-            conn.close()
         return _row_to_mandate(row) if row else None
 
     def revoked_count(self) -> int:
@@ -189,16 +164,13 @@ class MandateStore:
         stands as evidence that withdrawing authority is recorded rather than
         erased.
         """
-        conn = self._connect()
-        try:
+        with self.db.connection() as conn:
             return conn.execute(
                 "SELECT COUNT(*) AS n FROM mandates WHERE revoked_at IS NOT NULL"
             ).fetchone()["n"]
-        finally:
-            conn.close()
 
 
-def _row_to_mandate(row: sqlite3.Row) -> Mandate:
+def _row_to_mandate(row: dict) -> Mandate:
     return Mandate(
         mandate_id=row["mandate_id"],
         agent_id=row["agent_id"],
