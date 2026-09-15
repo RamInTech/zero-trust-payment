@@ -3,12 +3,18 @@
 Every policy decision and every money action lands here, with enough structure
 that a human can reconstruct what happened and why WITHOUT reading the code.
 
-Two properties make that claim real rather than aspirational:
+Three properties make that claim real rather than aspirational:
 
 1. APPEND-ONLY IS ENFORCED BY THE DATABASE, NOT BY DISCIPLINE. Triggers reject
    UPDATE and DELETE on the table outright, so tampering fails even from a raw
-   `sqlite3` shell. A rule the code merely follows is a rule a future refactor
+   `psql` session. A rule the code merely follows is a rule a future refactor
    can quietly break; a trigger is not.
+
+   Phase 10 (Postgres) adds a third trigger, and the reason is worth knowing:
+   Postgres's TRUNCATE empties a table WITHOUT firing row-level triggers. The
+   UPDATE and DELETE triggers alone would have let `TRUNCATE audit_log` wipe
+   the whole history in one statement -- a hole SQLite never had, because
+   SQLite has no TRUNCATE. A statement-level BEFORE TRUNCATE trigger closes it.
 
 2. EVENTS ARE NAMED, NOT PROSE. A fixed vocabulary (`EventType`) means a
    reviewer greps for `POLICY_DENIED` instead of parsing sentences, and a test
@@ -17,8 +23,8 @@ Two properties make that claim real rather than aspirational:
 3. ENTRIES ARE HASH-CHAINED. Each row carries the SHA-256 of its own contents
    linked to its predecessor's hash, so removing, reordering or editing a row
    breaks every link after it. The triggers above stop tampering THROUGH the
-   database; the chain detects tampering that went AROUND it -- a swapped file,
-   a restored backup, a row rewritten after someone dropped the triggers.
+   database; the chain detects tampering that went AROUND it -- a restored
+   backup, a row rewritten after someone dropped the triggers.
 
    Be precise about what this does and does not buy, because the difference
    matters. It makes PARTIAL tampering detectable. It does NOT make a complete
@@ -41,17 +47,18 @@ from __future__ import annotations
 
 import hashlib
 import json
-import sqlite3
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Optional
 
+import psycopg
+
+from zerotrust.db import Database
+
 #: The `prev_hash` of the first entry in a chain. A fixed, recognisable value
-#: rather than NULL, so "this is the genesis link" and "this row predates the
-#: chain" stay distinguishable -- the latter is NULL and is reported as
-#: unverifiable rather than silently treated as a beginning.
+#: rather than NULL, so the genesis link is an ordinary, verifiable link.
 GENESIS_HASH = "0" * 64
 
 
@@ -146,44 +153,57 @@ class AuditEntry:
         return " ".join(parts)
 
 
+#: Names of the triggers that make the log append-only. Read back from the
+#: live schema by the reference client, so a viewer sees the mechanism itself.
+APPEND_ONLY_TRIGGERS = ("audit_log_no_update", "audit_log_no_delete",
+                        "audit_log_no_truncate")
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS audit_log (
-    event_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id        BIGINT PRIMARY KEY,
     event_type      TEXT NOT NULL,
     actor           TEXT NOT NULL,
-    occurred_at     REAL NOT NULL,
+    occurred_at     DOUBLE PRECISION NOT NULL,
     request_id      TEXT,
     agent_id        TEXT,
     mandate_id      TEXT,
     idempotency_key TEXT,
     rule            TEXT,
     reason          TEXT,
+    -- TEXT, deliberately not JSONB. The hash covers this exact string, and
+    -- JSONB normalises key order and whitespace on the way in -- every entry
+    -- would then fail verification without anyone having touched it.
     details         TEXT NOT NULL DEFAULT '{}',
-    -- Nullable on purpose. Rows written before the chain existed have NULL
-    -- here, and `verify()` reports them as unverifiable rather than pretending
-    -- they are sound. They cannot be backfilled: the triggers below forbid
-    -- UPDATE, which is the guarantee working as intended, not an obstacle to
-    -- route around.
-    prev_hash       TEXT,
-    entry_hash      TEXT
+    prev_hash       TEXT NOT NULL,
+    entry_hash      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_request ON audit_log(request_id);
 CREATE INDEX IF NOT EXISTS idx_audit_type ON audit_log(event_type);
 
 -- Append-only, enforced by the database. These are the teeth behind the
 -- invariant in CLAUDE.md: a past entry cannot be altered or removed, not even
--- from a raw sqlite3 shell.
-CREATE TRIGGER IF NOT EXISTS audit_log_no_update
-BEFORE UPDATE ON audit_log
+-- from a raw psql session.
+CREATE OR REPLACE FUNCTION audit_log_refuse_change() RETURNS trigger
+LANGUAGE plpgsql AS $$
 BEGIN
-    SELECT RAISE(ABORT, 'audit_log is append-only: UPDATE is not permitted');
-END;
+    RAISE EXCEPTION 'audit_log is append-only: % is not permitted', TG_OP
+        USING ERRCODE = 'restrict_violation';
+END
+$$;
 
-CREATE TRIGGER IF NOT EXISTS audit_log_no_delete
+CREATE OR REPLACE TRIGGER audit_log_no_update
+BEFORE UPDATE ON audit_log
+FOR EACH ROW EXECUTE FUNCTION audit_log_refuse_change();
+
+CREATE OR REPLACE TRIGGER audit_log_no_delete
 BEFORE DELETE ON audit_log
-BEGIN
-    SELECT RAISE(ABORT, 'audit_log is append-only: DELETE is not permitted');
-END;
+FOR EACH ROW EXECUTE FUNCTION audit_log_refuse_change();
+
+-- TRUNCATE skips row-level triggers entirely. Without this one, the two above
+-- would stop a single-row edit and allow the whole history to be emptied.
+CREATE OR REPLACE TRIGGER audit_log_no_truncate
+BEFORE TRUNCATE ON audit_log
+FOR EACH STATEMENT EXECUTE FUNCTION audit_log_refuse_change();
 """
 
 
@@ -220,10 +240,6 @@ class ChainReport:
 
     intact: bool
     checked: int
-    #: Rows written before the chain existed. Not a failure -- but not
-    #: evidence of integrity either, so it is reported separately and never
-    #: folded into `checked`.
-    unverifiable: int
     head: Optional[str]
     #: The first row whose link does not hold, and why. None when intact.
     broken_at: Optional[int] = None
@@ -233,21 +249,15 @@ class ChainReport:
     def summary(self) -> str:
         """One honest line, for anywhere the boolean alone would mislead.
 
-        `intact` is True on an empty or entirely pre-chain log -- vacuously, as
-        no link failed. Displaying that as "chain intact" would tell a viewer
-        their entries are protected when not one of them is. The distinction
-        between "nothing is broken" and "nothing is covered" belongs on screen.
+        `intact` is True on an empty log -- vacuously, as no link failed.
+        Displaying that as "chain intact" would tell a viewer their entries
+        are protected when there are none. The distinction between "nothing
+        is broken" and "nothing is covered" belongs on screen.
         """
         if not self.intact:
             return f"BROKEN at entry {self.broken_at}"
         if self.checked == 0:
-            return (
-                f"no entries chained yet ({self.unverifiable} predate the chain)"
-                if self.unverifiable else "no entries yet"
-            )
-        if self.unverifiable:
-            return (f"intact — {self.checked} verified, "
-                    f"{self.unverifiable} predate the chain")
+            return "no entries yet"
         return f"intact — {self.checked} verified"
 
     def as_dict(self) -> dict:
@@ -255,7 +265,6 @@ class ChainReport:
             "intact": self.intact,
             "summary": self.summary,
             "checked": self.checked,
-            "unverifiable": self.unverifiable,
             "head": self.head,
             "broken_at": self.broken_at,
             "detail": self.detail,
@@ -263,37 +272,10 @@ class ChainReport:
 
 
 class AuditLog:
-    def __init__(self, db_path: str, clock: Callable[[], float] = time.time) -> None:
-        self.db_path = db_path
+    def __init__(self, db: Database, clock: Callable[[], float] = time.time) -> None:
+        self.db = db
         self._clock = clock
-        conn = self._connect()
-        try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.executescript(_SCHEMA)
-            self._add_chain_columns(conn)
-        finally:
-            conn.close()
-
-    @staticmethod
-    def _add_chain_columns(conn: sqlite3.Connection) -> None:
-        """Bring a pre-chain database up to the current schema.
-
-        `CREATE TABLE IF NOT EXISTS` is a no-op on a table that already exists,
-        so a log written before the chain landed keeps its old shape and every
-        read of `entry_hash` would raise. Adding the columns nullable is the
-        whole migration -- existing rows keep NULL and verify as unverifiable,
-        which is the honest outcome, since the triggers correctly refuse the
-        UPDATE that backfilling them would require.
-        """
-        existing = {row["name"] for row in conn.execute("PRAGMA table_info(audit_log)")}
-        for column in ("prev_hash", "entry_hash"):
-            if column not in existing:
-                conn.execute(f"ALTER TABLE audit_log ADD COLUMN {column} TEXT")
-
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=30.0, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        return conn
+        db.apply_schema(_SCHEMA)
 
     @staticmethod
     def new_request_id() -> str:
@@ -316,25 +298,23 @@ class AuditLog:
         occurred_at = self._clock()
         payload = json.dumps(details or {}, sort_keys=True, default=str)
         try:
-            conn = self._connect()
-            try:
-                # BEGIN IMMEDIATE takes the write lock before the tail is read,
-                # which is what makes the chain safe under concurrent writers.
-                # Reading the tail outside the lock would let two appenders see
-                # the same predecessor and fork the chain into two branches
-                # sharing one prev_hash -- and the fork would verify cleanly
-                # from either side, so nothing downstream would ever notice.
-                conn.execute("BEGIN IMMEDIATE")
+            with self.db.transaction() as conn:
+                # The tail is read under a lock held until COMMIT, which is
+                # what makes the chain safe under concurrent writers. Reading
+                # it without one would let two appenders see the same
+                # predecessor and fork the chain into two branches sharing one
+                # prev_hash -- and the fork would verify cleanly from either
+                # side, so nothing downstream would ever notice.
+                self.db.lock(conn, "audit_log:tail")
                 tail = conn.execute(
                     "SELECT event_id, entry_hash FROM audit_log "
                     "ORDER BY event_id DESC LIMIT 1"
                 ).fetchone()
-                # The id is allocated here rather than taken from lastrowid
-                # afterwards, because it belongs inside the hash and the
-                # triggers make writing it back in a second statement
-                # impossible.
+                # The id is allocated here rather than by a sequence, because
+                # it belongs inside the hash and the triggers make writing it
+                # back in a second statement impossible.
                 event_id = (tail["event_id"] + 1) if tail else 1
-                prev_hash = (tail["entry_hash"] if tail else GENESIS_HASH) or GENESIS_HASH
+                prev_hash = tail["entry_hash"] if tail else GENESIS_HASH
                 entry_hash = chain_hash(
                     prev_hash, event_id=event_id, event_type=event_type.value,
                     actor=actor.value, occurred_at=occurred_at,
@@ -347,7 +327,7 @@ class AuditLog:
                     "occurred_at, request_id, agent_id, mandate_id, "
                     "idempotency_key, rule, reason, details, prev_hash, "
                     "entry_hash) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                     (
                         event_id,
                         event_type.value,
@@ -364,10 +344,7 @@ class AuditLog:
                         entry_hash,
                     ),
                 )
-                conn.execute("COMMIT")
-            finally:
-                conn.close()
-        except sqlite3.Error as exc:
+        except psycopg.Error as exc:
             raise AuditWriteError(
                 f"could not append {event_type.value} to the audit log: {exc}"
             ) from exc
@@ -394,27 +371,24 @@ class AuditLog:
     def for_request(self, request_id: str) -> list[AuditEntry]:
         """Every entry for one request, in order -- the story of what happened."""
         return self._query(
-            "SELECT * FROM audit_log WHERE request_id = ? ORDER BY event_id",
+            "SELECT * FROM audit_log WHERE request_id = %s ORDER BY event_id",
             (request_id,),
         )
 
     def of_type(self, event_type: EventType) -> list[AuditEntry]:
         return self._query(
-            "SELECT * FROM audit_log WHERE event_type = ? ORDER BY event_id",
+            "SELECT * FROM audit_log WHERE event_type = %s ORDER BY event_id",
             (event_type.value,),
         )
 
     def count_of(self, event_type: EventType, request_id: Optional[str] = None) -> int:
-        sql = "SELECT COUNT(*) AS n FROM audit_log WHERE event_type = ?"
+        sql = "SELECT COUNT(*) AS n FROM audit_log WHERE event_type = %s"
         params: tuple[Any, ...] = (event_type.value,)
         if request_id is not None:
-            sql += " AND request_id = ?"
+            sql += " AND request_id = %s"
             params += (request_id,)
-        conn = self._connect()
-        try:
+        with self.db.connection() as conn:
             return conn.execute(sql, params).fetchone()["n"]
-        finally:
-            conn.close()
 
     def timeline(self, request_id: str) -> str:
         """The log rendered for a human, with no access to the code."""
@@ -427,6 +401,23 @@ class AuditLog:
 
     # -- integrity ---------------------------------------------------------
 
+    def triggers(self) -> list[str]:
+        """The append-only triggers as they exist in the live schema.
+
+        Read from Postgres's catalog rather than repeated from this file, so
+        a trigger someone dropped shows up missing instead of still described.
+        """
+        with self.db.connection() as conn:
+            rows = conn.execute(
+                "SELECT pg_get_triggerdef(t.oid) AS definition "
+                "FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE c.relname = 'audit_log' AND n.nspname = %s "
+                "AND NOT t.tgisinternal ORDER BY t.tgname",
+                (self.db.schema,),
+            ).fetchall()
+        return [r["definition"] for r in rows]
+
     def head(self) -> Optional[str]:
         """The newest entry's hash: the value worth recording elsewhere.
 
@@ -435,13 +426,10 @@ class AuditLog:
         somewhere the database's owner cannot silently edit is what makes a
         wholesale rewrite detectable.
         """
-        conn = self._connect()
-        try:
+        with self.db.connection() as conn:
             row = conn.execute(
                 "SELECT entry_hash FROM audit_log ORDER BY event_id DESC LIMIT 1"
             ).fetchone()
-        finally:
-            conn.close()
         return row["entry_hash"] if row else None
 
     def verify(self) -> ChainReport:
@@ -450,30 +438,21 @@ class AuditLog:
         Reads the raw columns rather than `AuditEntry` objects, because
         `details` has to be hashed as the stored string -- see `chain_hash`.
         """
-        conn = self._connect()
-        try:
+        with self.db.connection() as conn:
             rows = conn.execute(
                 "SELECT * FROM audit_log ORDER BY event_id"
             ).fetchall()
-        finally:
-            conn.close()
 
-        unverifiable = 0
         checked = 0
         prev_hash = GENESIS_HASH
         head: Optional[str] = None
 
         for row in rows:
             stored = row["entry_hash"]
-            if stored is None:
-                # Predates the chain. Counted and reported, never assumed sound.
-                unverifiable += 1
-                continue
-
             if row["prev_hash"] != prev_hash:
                 return ChainReport(
-                    intact=False, checked=checked, unverifiable=unverifiable,
-                    head=head, broken_at=row["event_id"],
+                    intact=False, checked=checked, head=head,
+                    broken_at=row["event_id"],
                     detail=(
                         f"entry {row['event_id']} expected to follow "
                         f"{prev_hash[:12]}… but records {str(row['prev_hash'])[:12]}… "
@@ -491,8 +470,8 @@ class AuditLog:
             )
             if expected != stored:
                 return ChainReport(
-                    intact=False, checked=checked, unverifiable=unverifiable,
-                    head=head, broken_at=row["event_id"],
+                    intact=False, checked=checked, head=head,
+                    broken_at=row["event_id"],
                     detail=(
                         f"entry {row['event_id']} hashes to {expected[:12]}… "
                         f"but stores {stored[:12]}… — its contents were altered"
@@ -503,19 +482,15 @@ class AuditLog:
             prev_hash = stored
             head = stored
 
-        return ChainReport(intact=True, checked=checked,
-                           unverifiable=unverifiable, head=head)
+        return ChainReport(intact=True, checked=checked, head=head)
 
     def _query(self, sql: str, params: tuple = ()) -> list[AuditEntry]:
-        conn = self._connect()
-        try:
+        with self.db.connection() as conn:
             rows = conn.execute(sql, params).fetchall()
-        finally:
-            conn.close()
         return [_row_to_entry(r) for r in rows]
 
 
-def _row_to_entry(row: sqlite3.Row) -> AuditEntry:
+def _row_to_entry(row: dict) -> AuditEntry:
     return AuditEntry(
         event_id=row["event_id"],
         event_type=EventType(row["event_type"]),

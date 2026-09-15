@@ -4,16 +4,26 @@ Three claims, each mapped to a completion-test bullet:
   1. every Phase 1 and Phase 3 outcome produces exactly ONE named entry;
   2. entries are immutable -- tampering fails at the database, not by policy;
   3. the log alone explains a decision, without reading the code.
+
+Phase 10: every attack on the database now arrives through a separate
+connection from outside the application's pool, and fails with Postgres's
+`restrict_violation`, which psycopg reports as an `IntegrityError`.
 """
 
 from __future__ import annotations
 
-import sqlite3
 import threading
 
+import psycopg
 import pytest
 
-from zerotrust.audit import Actor, AuditLog, AuditWriteError, EventType
+from zerotrust.audit import (
+    APPEND_ONLY_TRIGGERS,
+    Actor,
+    AuditLog,
+    AuditWriteError,
+    EventType,
+)
 from zerotrust.gateway import PurchaseGateway
 from zerotrust.idempotency import IdempotencyStore, Outcome
 from zerotrust.mandate import Mandate, MandateStore
@@ -40,14 +50,13 @@ def clock():
 
 
 @pytest.fixture
-def audit(tmp_path, clock):
-    return AuditLog(str(tmp_path / "audit.db"), clock=clock)
+def audit(db, clock):
+    return AuditLog(db, clock=clock)
 
 
 @pytest.fixture
-def engine(tmp_path, clock):
-    return PolicyEngine(MandateStore(str(tmp_path / "policy.db"), clock=clock),
-                        clock=clock)
+def engine(db, clock):
+    return PolicyEngine(MandateStore(db, clock=clock), clock=clock)
 
 
 @pytest.fixture
@@ -66,9 +75,9 @@ def mandate(engine, clock):
 
 
 @pytest.fixture
-def gateway(engine, audit, tmp_path):
+def gateway(engine, audit):
     calls = []
-    store = IdempotencyStore(str(tmp_path / "idem.db"))
+    store = IdempotencyStore(engine.db)
 
     def execute(request):
         calls.append(request)
@@ -176,8 +185,8 @@ def test_conflict_logs_conflict(gateway, audit, mandate):
     assert audit.count_of(EventType.IDEMPOTENCY_CONFLICT) == 1
 
 
-def test_in_progress_logs_in_progress(engine, audit, tmp_path, mandate):
-    store = IdempotencyStore(str(tmp_path / "idem.db"))
+def test_in_progress_logs_in_progress(engine, audit, mandate):
+    store = IdempotencyStore(engine.db)
     released, claimed = threading.Event(), threading.Event()
 
     def slow(request):
@@ -199,9 +208,8 @@ def test_in_progress_logs_in_progress(engine, audit, tmp_path, mandate):
     assert EventType.IDEMPOTENCY_IN_PROGRESS in types
 
 
-def test_reclaimed_logs_reclaimed(engine, audit, tmp_path, mandate, clock):
-    store = IdempotencyStore(str(tmp_path / "idem.db"),
-                             stale_after_seconds=30.0, clock=clock)
+def test_reclaimed_logs_reclaimed(engine, audit, mandate, clock):
+    store = IdempotencyStore(engine.db, stale_after_seconds=30.0, clock=clock)
     claimed = threading.Event()
 
     def hang(request):
@@ -232,8 +240,8 @@ def test_every_phase1_and_phase3_outcome_has_a_distinct_event(gateway, audit,
     assert len(set(OUTCOME_EVENTS.values())) == len(OUTCOME_EVENTS)
 
 
-def test_failed_execution_logs_payment_failed(engine, audit, tmp_path, mandate):
-    store = IdempotencyStore(str(tmp_path / "idem.db"))
+def test_failed_execution_logs_payment_failed(engine, audit, mandate):
+    store = IdempotencyStore(engine.db)
 
     def boom(request):
         raise RuntimeError("provider unreachable")
@@ -254,13 +262,10 @@ def test_update_is_rejected_by_the_database(audit):
     audit.record(EventType.POLICY_DENIED, Actor.POLICY_ENGINE,
                  request_id="r1", rule="AMOUNT_EXCEEDS_CAP", reason="over cap")
 
-    conn = sqlite3.connect(audit.db_path)
-    try:
-        with pytest.raises(sqlite3.IntegrityError) as exc:
+    with audit.db.outside_connection() as conn:
+        with pytest.raises(psycopg.IntegrityError) as exc:
             conn.execute("UPDATE audit_log SET reason = 'nothing happened'")
-        assert "append-only" in str(exc.value)
-    finally:
-        conn.close()
+    assert "append-only" in str(exc.value)
 
     assert audit.all()[0].reason == "over cap"
 
@@ -268,33 +273,67 @@ def test_update_is_rejected_by_the_database(audit):
 def test_delete_is_rejected_by_the_database(audit):
     audit.record(EventType.POLICY_DENIED, Actor.POLICY_ENGINE, request_id="r1")
 
-    conn = sqlite3.connect(audit.db_path)
-    try:
-        with pytest.raises(sqlite3.IntegrityError) as exc:
+    with audit.db.outside_connection() as conn:
+        with pytest.raises(psycopg.IntegrityError) as exc:
             conn.execute("DELETE FROM audit_log")
-        assert "append-only" in str(exc.value)
-    finally:
-        conn.close()
+    assert "append-only" in str(exc.value)
 
     assert len(audit.all()) == 1
+
+
+def test_truncate_is_rejected_by_the_database(audit):
+    """TRUNCATE is a separate command in Postgres and needs its own trigger."""
+    audit.record(EventType.POLICY_DENIED, Actor.POLICY_ENGINE, request_id="r1")
+
+    with audit.db.outside_connection() as conn:
+        with pytest.raises(psycopg.IntegrityError) as exc:
+            conn.execute("TRUNCATE audit_log")
+    assert "append-only" in str(exc.value)
+
+    assert len(audit.all()) == 1
+
+
+def test_without_its_own_trigger_truncate_would_wipe_the_log(audit):
+    """The hole is real, not theoretical: row triggers do not see TRUNCATE.
+
+    With only the UPDATE and DELETE triggers in place, TRUNCATE empties the
+    table. That is why the migration to Postgres needed a third trigger rather
+    than a straight copy of the SQLite two.
+    """
+    audit.record(EventType.POLICY_DENIED, Actor.POLICY_ENGINE, request_id="r1")
+
+    with audit.db.outside_connection() as conn:
+        conn.execute("DROP TRIGGER audit_log_no_truncate ON audit_log")
+        with pytest.raises(psycopg.IntegrityError):
+            conn.execute("DELETE FROM audit_log")   # row trigger still holds
+        conn.execute("TRUNCATE audit_log")          # ...and TRUNCATE walks past it
+
+    assert audit.all() == []
 
 
 def test_tampering_fails_even_targeting_one_row(audit):
     audit.record(EventType.POLICY_DENIED, Actor.POLICY_ENGINE, request_id="r1")
     audit.record(EventType.POLICY_APPROVED, Actor.POLICY_ENGINE, request_id="r2")
 
-    conn = sqlite3.connect(audit.db_path)
-    try:
+    with audit.db.outside_connection() as conn:
         for sql in (
             "UPDATE audit_log SET rule = 'X' WHERE event_id = 1",
             "DELETE FROM audit_log WHERE event_id = 1",
         ):
-            with pytest.raises(sqlite3.IntegrityError):
+            with pytest.raises(psycopg.IntegrityError):
                 conn.execute(sql)
-    finally:
-        conn.close()
 
     assert len(audit.all()) == 2
+
+
+def test_the_live_schema_carries_every_append_only_trigger(audit):
+    """Read back from Postgres's catalog, not from this file."""
+    definitions = audit.triggers()
+    for name in APPEND_ONLY_TRIGGERS:
+        assert any(name in d for d in definitions), f"{name} is missing"
+    assert any("BEFORE UPDATE" in d for d in definitions)
+    assert any("BEFORE DELETE" in d for d in definitions)
+    assert any("BEFORE TRUNCATE" in d for d in definitions)
 
 
 def test_the_log_has_no_update_or_delete_api(audit):
@@ -305,9 +344,9 @@ def test_the_log_has_no_update_or_delete_api(audit):
         )
 
 
-def test_an_unwritable_log_blocks_the_money_action(engine, tmp_path, mandate):
+def test_an_unwritable_log_blocks_the_money_action(engine, mandate):
     """Log-before-execute: a broken log stops the payment, never the reverse."""
-    store = IdempotencyStore(str(tmp_path / "idem.db"))
+    store = IdempotencyStore(engine.db)
     calls = []
 
     class BrokenLog(AuditLog):
@@ -316,7 +355,7 @@ def test_an_unwritable_log_blocks_the_money_action(engine, tmp_path, mandate):
 
     gw = PurchaseGateway(engine, store,
                          lambda r: calls.append(r) or {"order_id": "x"},
-                         audit=BrokenLog(str(tmp_path / "audit2.db")))
+                         audit=BrokenLog(engine.db))
 
     with pytest.raises(AuditWriteError):
         gw.submit(req())
@@ -391,12 +430,12 @@ def test_entries_are_ordered_and_tied_to_one_request(gateway, audit, mandate):
         assert [e.event_id for e in entries] == sorted(e.event_id for e in entries)
 
 
-def test_entries_survive_reopening_the_database(tmp_path, clock):
-    log = AuditLog(str(tmp_path / "a.db"), clock=clock)
+def test_entries_survive_reopening_the_database(db, clock):
+    log = AuditLog(db, clock=clock)
     log.record(EventType.POLICY_DENIED, Actor.POLICY_ENGINE, request_id="r1",
                rule="SKU_NOT_ALLOWED", reason="not allowed")
 
-    reopened = AuditLog(str(tmp_path / "a.db"), clock=clock)
+    reopened = AuditLog(db, clock=clock)
     entries = reopened.for_request("r1")
     assert len(entries) == 1
     assert entries[0].rule == "SKU_NOT_ALLOWED"
@@ -405,8 +444,8 @@ def test_entries_survive_reopening_the_database(tmp_path, clock):
 # -- concurrency: no entries lost under load ------------------------------
 
 @pytest.mark.parametrize("run", range(5))
-def test_concurrent_writers_lose_no_entries(tmp_path, clock, run):
-    log = AuditLog(str(tmp_path / f"a{run}.db"), clock=clock)
+def test_concurrent_writers_lose_no_entries(db, clock, run):
+    log = AuditLog(db, clock=clock)
     threads_n, per_thread = 16, 10
     barrier = threading.Barrier(threads_n)
 
@@ -430,14 +469,10 @@ def test_concurrent_writers_lose_no_entries(tmp_path, clock, run):
 # -- the hash chain --------------------------------------------------------
 #
 # The triggers stop tampering THROUGH the database. These cover tampering that
-# goes AROUND it: dropping the triggers, editing the file directly, restoring a
-# doctored backup. Every case here first proves the tampering SUCCEEDED at the
-# SQL level, so the assertion is that the chain detected a real edit rather
-# than that something else blocked it.
-
-def _log(tmp_path, name="chain.db"):
-    return AuditLog(str(tmp_path / name))
-
+# goes AROUND it: dropping the triggers, restoring a doctored backup. Every
+# case here first proves the tampering SUCCEEDED at the SQL level, so the
+# assertion is that the chain detected a real edit rather than that something
+# else blocked it.
 
 def _fill(log, n=4):
     for i in range(n):
@@ -446,39 +481,37 @@ def _fill(log, n=4):
 
 
 def _unlocked(log):
-    """A raw connection with the append-only triggers removed.
+    """An outside connection with the append-only triggers removed.
 
     Dropping them is allowed -- that is precisely the gap the chain exists to
     cover, and a test that could not drop them would be testing the triggers
-    again instead of the chain.
+    again instead of the chain. The caller closes it.
     """
-    conn = sqlite3.connect(log.db_path, isolation_level=None)
-    conn.execute("DROP TRIGGER IF EXISTS audit_log_no_update")
-    conn.execute("DROP TRIGGER IF EXISTS audit_log_no_delete")
+    conn = log.db.outside_connection()
+    for name in APPEND_ONLY_TRIGGERS:
+        conn.execute(f"DROP TRIGGER IF EXISTS {name} ON audit_log")
     return conn
 
 
-def test_a_clean_log_verifies(tmp_path):
-    log = _log(tmp_path)
+def test_a_clean_log_verifies(db):
+    log = AuditLog(db)
     _fill(log)
     report = log.verify()
     assert report.intact is True
     assert report.checked == 4
-    assert report.unverifiable == 0
     assert report.broken_at is None
 
 
-def test_editing_a_row_breaks_the_chain(tmp_path):
-    log = _log(tmp_path)
+def test_editing_a_row_breaks_the_chain(db):
+    log = AuditLog(db)
     _fill(log)
-    conn = _unlocked(log)
-    conn.execute("UPDATE audit_log SET reason = 'nothing to see here' "
-                 "WHERE event_id = 2")
-    # The edit really landed -- otherwise this would be re-testing the triggers.
-    assert conn.execute(
-        "SELECT reason FROM audit_log WHERE event_id = 2"
-    ).fetchone()[0] == "nothing to see here"
-    conn.close()
+    with _unlocked(log) as conn:
+        conn.execute("UPDATE audit_log SET reason = 'nothing to see here' "
+                     "WHERE event_id = 2")
+        # The edit really landed -- otherwise this would re-test the triggers.
+        assert conn.execute(
+            "SELECT reason FROM audit_log WHERE event_id = 2"
+        ).fetchone()["reason"] == "nothing to see here"
 
     report = log.verify()
     assert report.intact is False
@@ -486,13 +519,13 @@ def test_editing_a_row_breaks_the_chain(tmp_path):
     assert "contents were altered" in report.detail
 
 
-def test_deleting_a_row_breaks_the_chain(tmp_path):
-    log = _log(tmp_path)
+def test_deleting_a_row_breaks_the_chain(db):
+    log = AuditLog(db)
     _fill(log)
-    conn = _unlocked(log)
-    conn.execute("DELETE FROM audit_log WHERE event_id = 2")
-    assert conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0] == 3
-    conn.close()
+    with _unlocked(log) as conn:
+        conn.execute("DELETE FROM audit_log WHERE event_id = 2")
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM audit_log").fetchone()["n"] == 3
 
     report = log.verify()
     assert report.intact is False
@@ -501,119 +534,94 @@ def test_deleting_a_row_breaks_the_chain(tmp_path):
     assert "removed, reordered, or inserted" in report.detail
 
 
-def test_renumbering_a_row_breaks_the_chain(tmp_path):
+def test_renumbering_a_row_breaks_the_chain(db):
     """The event_id is inside the hash, so resequencing is detected too."""
-    log = _log(tmp_path)
+    log = AuditLog(db)
     _fill(log)
-    conn = _unlocked(log)
-    conn.execute("UPDATE audit_log SET event_id = 99 WHERE event_id = 4")
-    conn.close()
+    with _unlocked(log) as conn:
+        conn.execute("UPDATE audit_log SET event_id = 99 WHERE event_id = 4")
 
     report = log.verify()
     assert report.intact is False
     assert report.broken_at == 99
 
 
-def test_a_forged_entry_appended_by_hand_is_rejected(tmp_path):
+def test_a_forged_entry_appended_by_hand_is_rejected(db):
     """Inserting a row without recomputing its hash does not pass."""
-    log = _log(tmp_path)
+    log = AuditLog(db)
     _fill(log, 2)
-    conn = _unlocked(log)
-    conn.execute(
-        "INSERT INTO audit_log (event_id, event_type, actor, occurred_at, "
-        "request_id, details, prev_hash, entry_hash) "
-        "VALUES (3, 'POLICY_APPROVED', 'POLICY_ENGINE', 1.0, 'req_forged', "
-        "'{}', ?, 'deadbeef')",
-        (log.head(),))
-    conn.close()
+    with _unlocked(log) as conn:
+        conn.execute(
+            "INSERT INTO audit_log (event_id, event_type, actor, occurred_at, "
+            "request_id, details, prev_hash, entry_hash) "
+            "VALUES (3, 'POLICY_APPROVED', 'POLICY_ENGINE', 1.0, 'req_forged', "
+            "'{}', %s, 'deadbeef')",
+            (log.head(),))
 
     report = log.verify()
     assert report.intact is False
     assert report.broken_at == 3
 
 
-def test_rows_written_before_the_chain_are_reported_not_assumed_sound(tmp_path):
-    """A pre-chain row is unverifiable, which is not the same as verified.
+def test_an_entry_without_a_hash_is_refused_by_the_schema(db):
+    """Phase 10 started fresh, so every row is chained from the first.
 
-    The triggers forbid the UPDATE that backfilling a hash would need, so these
-    rows can never be brought into the chain. Counting them as intact would
-    turn the absence of evidence into evidence.
+    The SQLite log allowed NULL hashes for rows written before the chain
+    existed, and reported them as unverifiable. There is no such history now,
+    so the columns are NOT NULL: an unchained row cannot be written at all,
+    even by someone who has dropped the append-only triggers.
     """
-    log = _log(tmp_path)
-    _fill(log, 1)
-    conn = _unlocked(log)
-    conn.execute(
-        "INSERT INTO audit_log (event_id, event_type, actor, occurred_at, "
-        "details, prev_hash, entry_hash) "
-        "VALUES (0, 'POLICY_APPROVED', 'POLICY_ENGINE', 0.5, '{}', NULL, NULL)")
-    conn.close()
-
-    report = log.verify()
-    assert report.intact is True
-    assert report.unverifiable == 1
-    assert report.checked == 1
+    log = AuditLog(db)
+    with _unlocked(log) as conn:
+        with pytest.raises(psycopg.IntegrityError):
+            conn.execute(
+                "INSERT INTO audit_log (event_id, event_type, actor, "
+                "occurred_at, details, prev_hash, entry_hash) VALUES "
+                "(1, 'POLICY_APPROVED', 'POLICY_ENGINE', 1.0, '{}', NULL, NULL)")
 
 
-def test_the_chain_survives_a_reopen(tmp_path):
-    """Reopening must migrate, not restart the chain from genesis."""
-    log = _log(tmp_path)
+def test_the_chain_survives_a_reopen(db):
+    """Reopening must continue the chain, not restart it from genesis."""
+    log = AuditLog(db)
     _fill(log, 2)
     head_before = log.head()
 
-    reopened = AuditLog(str(tmp_path / "chain.db"))
+    reopened = AuditLog(db)
     reopened.record(EventType.POLICY_DENIED, Actor.POLICY_ENGINE,
                     request_id="req_x", rule="AMOUNT_EXCEEDS_CAP")
     assert reopened.verify().intact is True
     assert reopened.verify().checked == 3
     # The new entry linked to the old head rather than to GENESIS.
-    conn = sqlite3.connect(log.db_path)
-    assert conn.execute(
-        "SELECT prev_hash FROM audit_log WHERE event_id = 3").fetchone()[0] == head_before
-    conn.close()
+    with db.outside_connection() as conn:
+        assert conn.execute(
+            "SELECT prev_hash FROM audit_log WHERE event_id = 3"
+        ).fetchone()["prev_hash"] == head_before
 
 
-def test_a_database_predating_the_chain_gains_the_columns(tmp_path):
-    """CREATE TABLE IF NOT EXISTS is a no-op, so the migration must ALTER."""
-    path = str(tmp_path / "old.db")
-    conn = sqlite3.connect(path, isolation_level=None)
-    conn.execute(
-        "CREATE TABLE audit_log ("
-        " event_id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT NOT NULL,"
-        " actor TEXT NOT NULL, occurred_at REAL NOT NULL, request_id TEXT,"
-        " agent_id TEXT, mandate_id TEXT, idempotency_key TEXT, rule TEXT,"
-        " reason TEXT, details TEXT NOT NULL DEFAULT '{}')")
-    conn.execute(
-        "INSERT INTO audit_log (event_type, actor, occurred_at, details) "
-        "VALUES ('POLICY_APPROVED', 'POLICY_ENGINE', 1.0, '{}')")
-    conn.close()
-
-    log = AuditLog(path)          # must not raise
-    log.record(EventType.POLICY_APPROVED, Actor.POLICY_ENGINE, request_id="r")
-    report = log.verify()
-    assert report.unverifiable == 1
-    assert report.checked == 1
-    assert report.intact is True
-
-
-def test_concurrent_appends_produce_one_unbroken_chain(tmp_path):
-    """Eight threads appending at once must not fork the chain.
+@pytest.mark.parametrize("run", range(5))
+def test_concurrent_appends_produce_one_unbroken_chain(db, run):
+    """Sixteen threads appending at once must not fork the chain.
 
     Each link names its predecessor, so two writers reading the same tail would
     produce two rows sharing one prev_hash. The fork verifies cleanly from
     either side, which is why this needs its own test rather than being assumed
-    from the single-threaded case.
+    from the single-threaded case. Repeated, because a race that happens to
+    lose once proves nothing.
     """
-    log = _log(tmp_path)
+    log = AuditLog(db)
+    threads_n = 16
+    barrier = threading.Barrier(threads_n)
     errors = []
 
     def append(i):
+        barrier.wait()
         try:
             log.record(EventType.POLICY_APPROVED, Actor.POLICY_ENGINE,
                        request_id=f"req_{i}", reason=f"thread {i}")
         except Exception as exc:  # pragma: no cover - surfaced via `errors`
             errors.append(exc)
 
-    threads = [threading.Thread(target=append, args=(i,)) for i in range(8)]
+    threads = [threading.Thread(target=append, args=(i,)) for i in range(threads_n)]
     for t in threads:
         t.start()
     for t in threads:
@@ -622,49 +630,34 @@ def test_concurrent_appends_produce_one_unbroken_chain(tmp_path):
     assert errors == []
     report = log.verify()
     assert report.intact is True
-    assert report.checked == 8
+    assert report.checked == threads_n
 
-    conn = sqlite3.connect(log.db_path)
-    distinct = conn.execute(
-        "SELECT COUNT(DISTINCT prev_hash) FROM audit_log").fetchone()[0]
-    conn.close()
-    assert distinct == 8, "two entries share a predecessor: the chain forked"
+    with db.outside_connection() as conn:
+        distinct = conn.execute(
+            "SELECT COUNT(DISTINCT prev_hash) AS n FROM audit_log").fetchone()["n"]
+    assert distinct == threads_n, "two entries share a predecessor: the chain forked"
 
 
-def test_an_unchained_log_does_not_report_itself_as_protected(tmp_path):
-    """`intact` is vacuously True with nothing chained; the summary must not be.
+def test_an_empty_log_does_not_report_itself_as_protected(db):
+    """`intact` is vacuously True with nothing in the log; the summary is not.
 
-    A log of 132 pre-chain rows verifies as intact because no link failed. If a
-    UI renders that boolean as "chain intact", it tells a viewer their entries
-    are protected when not one of them is — the exact overclaim this project
-    exists to avoid.
+    If a UI renders that boolean as "chain intact", it tells a viewer their
+    entries are protected when there are none -- the exact overclaim this
+    project exists to avoid (JOURNAL.md Entry 21).
     """
-    log = _log(tmp_path, "empty.db")
+    log = AuditLog(db)
     empty = log.verify()
     assert empty.intact is True and empty.checked == 0
     assert empty.summary == "no entries yet"
-
-    conn = _unlocked(log)
-    conn.execute(
-        "INSERT INTO audit_log (event_id, event_type, actor, occurred_at, "
-        "details, prev_hash, entry_hash) "
-        "VALUES (1, 'POLICY_APPROVED', 'POLICY_ENGINE', 1.0, '{}', NULL, NULL)")
-    conn.close()
-
-    report = log.verify()
-    assert report.intact is True
-    assert "no entries chained yet" in report.summary
-    assert "intact" not in report.summary
+    assert "intact" not in empty.summary
 
     log.record(EventType.POLICY_APPROVED, Actor.POLICY_ENGINE, request_id="r")
-    mixed = log.verify()
-    assert mixed.summary == "intact — 1 verified, 1 predate the chain"
+    assert log.verify().summary == "intact — 1 verified"
 
 
-def test_a_broken_chain_says_so_in_the_summary(tmp_path):
-    log = _log(tmp_path, "broken.db")
+def test_a_broken_chain_says_so_in_the_summary(db):
+    log = AuditLog(db)
     _fill(log, 3)
-    conn = _unlocked(log)
-    conn.execute("UPDATE audit_log SET reason = 'edited' WHERE event_id = 2")
-    conn.close()
+    with _unlocked(log) as conn:
+        conn.execute("UPDATE audit_log SET reason = 'edited' WHERE event_id = 2")
     assert log.verify().summary == "BROKEN at entry 2"

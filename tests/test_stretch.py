@@ -57,17 +57,17 @@ def clock():
 
 
 @pytest.fixture
-def stack(tmp_path, clock):
+def stack(db, clock):
     catalog = demo_catalog()
-    audit = AuditLog(str(tmp_path / "audit.db"), clock=clock)
-    engine = PolicyEngine(MandateStore(str(tmp_path / "policy.db"), clock=clock),
+    audit = AuditLog(db, clock=clock)
+    engine = PolicyEngine(MandateStore(db, clock=clock),
                           clock=clock)
     engine.mandates.issue(Mandate(
         agent_id=AGENT, max_amount_paise=50_000,
         allowed_skus=frozenset({"SKU-COFFEE", "SKU-CAKE", "SKU-TEA"}),
         expires_at=clock() + 24 * HOUR, velocity_limit=3,
         velocity_window_secs=HOUR, created_at=clock()))
-    store = IdempotencyStore(str(tmp_path / "idem.db"), clock=clock)
+    store = IdempotencyStore(db, clock=clock)
     provider = SimulatedProvider()
     faults = FaultInjector()
     calls = []
@@ -380,8 +380,8 @@ def test_narratives_appear_on_the_explanation_when_asked(stack):
 # ========================================================================
 
 @pytest.fixture
-def many_agents(tmp_path, clock):
-    engine = PolicyEngine(MandateStore(str(tmp_path / "multi.db"), clock=clock),
+def many_agents(db, clock):
+    engine = PolicyEngine(MandateStore(db, clock=clock),
                           clock=clock)
     specs = {
         "agent_small": dict(max_amount_paise=10_000,
