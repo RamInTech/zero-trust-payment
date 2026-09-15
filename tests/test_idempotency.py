@@ -34,8 +34,8 @@ class FakeClock:
 
 
 @pytest.fixture
-def store(tmp_path):
-    return IdempotencyStore(str(tmp_path / "idem.db"))
+def store(db):
+    return IdempotencyStore(db)
 
 
 @pytest.fixture
@@ -79,9 +79,9 @@ def test_many_sequential_retries_still_charge_once(store, processor):
 # -- 2. concurrent storm, identical key -----------------------------------
 
 @pytest.mark.parametrize("run", range(20))
-def test_concurrent_identical_key_charges_exactly_once(tmp_path, run):
+def test_concurrent_identical_key_charges_exactly_once(db, run):
     """Repeated 20x: a single green run is not proof for a race."""
-    store = IdempotencyStore(str(tmp_path / f"idem_{run}.db"))
+    store = IdempotencyStore(db)
     # Latency widens the window between claim and completion, so racing
     # threads genuinely land mid-flight rather than after the fact.
     processor = MockPaymentProcessor(latency_seconds=0.02)
@@ -139,9 +139,9 @@ def test_same_key_different_payload_is_rejected(store, processor):
     assert processor.charges[0]["amount_paise"] == 50_000
 
 
-def test_conflict_against_an_in_flight_key_is_also_rejected(tmp_path):
+def test_conflict_against_an_in_flight_key_is_also_rejected(db):
     """A tampered replay must be rejected even before the original finishes."""
-    store = IdempotencyStore(str(tmp_path / "idem.db"))
+    store = IdempotencyStore(db)
     processor = MockPaymentProcessor()
     original = payload(amount=50_000)
     tampered = payload(amount=5_000_000)
@@ -186,8 +186,8 @@ def test_different_keys_charge_independently(store, processor):
 # -- 5. many concurrent orders, retries each, no cross-contamination -------
 
 @pytest.mark.parametrize("run", range(5))
-def test_concurrent_distinct_orders_do_not_contaminate(tmp_path, run):
-    store = IdempotencyStore(str(tmp_path / f"idem_{run}.db"))
+def test_concurrent_distinct_orders_do_not_contaminate(db, run):
+    store = IdempotencyStore(db)
     processor = MockPaymentProcessor(latency_seconds=0.01)
 
     orders = [f"order_{i}" for i in range(8)]
@@ -225,12 +225,10 @@ def test_concurrent_distinct_orders_do_not_contaminate(tmp_path, run):
 
 # -- 6. stale record is reclaimed -----------------------------------------
 
-def test_stale_processing_record_is_reclaimed(tmp_path):
+def test_stale_processing_record_is_reclaimed(db):
     """A claimant that crashed leaves PROCESSING behind; it must not block forever."""
     clock = FakeClock()
-    store = IdempotencyStore(
-        str(tmp_path / "idem.db"), stale_after_seconds=30.0, clock=clock
-    )
+    store = IdempotencyStore(db, stale_after_seconds=30.0, clock=clock)
     processor = MockPaymentProcessor()
     p = payload()
 
@@ -266,9 +264,9 @@ def test_stale_processing_record_is_reclaimed(tmp_path):
     assert processor.charge_count == 1
 
 
-def test_stale_reclaim_works_on_a_real_clock(tmp_path):
+def test_stale_reclaim_works_on_a_real_clock(db):
     """Same property without the fake clock, to prove it isn't a test artifact."""
-    store = IdempotencyStore(str(tmp_path / "idem.db"), stale_after_seconds=0.3)
+    store = IdempotencyStore(db, stale_after_seconds=0.3)
     processor = MockPaymentProcessor()
     p = payload()
 
@@ -292,12 +290,10 @@ def test_stale_reclaim_works_on_a_real_clock(tmp_path):
 
 
 @pytest.mark.parametrize("run", range(10))
-def test_concurrent_reclaim_of_a_stale_key_charges_once(tmp_path, run):
+def test_concurrent_reclaim_of_a_stale_key_charges_once(db, run):
     """Many callers spotting the same stale record must not all reclaim it."""
     clock = FakeClock()
-    store = IdempotencyStore(
-        str(tmp_path / f"idem_{run}.db"), stale_after_seconds=30.0, clock=clock
-    )
+    store = IdempotencyStore(db, stale_after_seconds=30.0, clock=clock)
     processor = MockPaymentProcessor(latency_seconds=0.01)
     p = payload()
 
@@ -335,12 +331,10 @@ def test_concurrent_reclaim_of_a_stale_key_charges_once(tmp_path, run):
 
 # -- 7. a genuinely in-flight key is NOT reclaimed -------------------------
 
-def test_fresh_in_flight_key_is_not_reclaimed(tmp_path):
+def test_fresh_in_flight_key_is_not_reclaimed(db):
     """The reclaim path must not weaken the core guarantee."""
     clock = FakeClock()
-    store = IdempotencyStore(
-        str(tmp_path / "idem.db"), stale_after_seconds=30.0, clock=clock
-    )
+    store = IdempotencyStore(db, stale_after_seconds=30.0, clock=clock)
     processor = MockPaymentProcessor()
     p = payload()
 
