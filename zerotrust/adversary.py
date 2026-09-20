@@ -28,10 +28,12 @@ from typing import Callable, Optional
 from zerotrust.api import create_app
 from zerotrust.audit import AuditLog, EventType
 from zerotrust.catalog import demo_catalog
+from zerotrust.db import Database
 from zerotrust.faults import Fault, FaultInjector
 from zerotrust.checkout import CheckoutService
 from zerotrust.gateway import PurchaseGateway
 from zerotrust.idempotency import IdempotencyStore
+from zerotrust.ledger import REVENUE, Ledger
 from zerotrust.intent import ParsedIntent, RuleBasedIntentParser
 from zerotrust.mandate import Mandate, MandateStore
 from zerotrust.policy import PolicyEngine, PurchaseRequest
@@ -89,22 +91,29 @@ class CompromisedParser:
 class AdversarialSuite:
     """Builds a complete stack, then attacks it."""
 
-    def __init__(self, tmpdir: str, clock: Optional[Callable[[], float]] = None):
+    def __init__(self, db: Database, clock: Optional[Callable[[], float]] = None):
+        """`db` should be a fresh schema: the attacks assume nothing else
+        has spent any agent's budget or written to the log."""
         from fastapi.testclient import TestClient
 
         self._clock = clock or time.time
+        self.db = db
         self.catalog = demo_catalog()
-        self.audit = AuditLog(f"{tmpdir}/audit.db", clock=self._clock)
-        self.engine = PolicyEngine(
-            MandateStore(f"{tmpdir}/policy.db", clock=self._clock),
-            clock=self._clock)
+        self.audit = AuditLog(db, clock=self._clock)
+        self.engine = PolicyEngine(MandateStore(db, clock=self._clock),
+                                   clock=self._clock)
         self.executed: list[PurchaseRequest] = []
         self._exec_lock = threading.Lock()
         self.faults = FaultInjector()
 
-        self.store = IdempotencyStore(f"{tmpdir}/idem.db", clock=self._clock)
+        self.store = IdempotencyStore(db, clock=self._clock)
+        # The books ride along with every attack. "0 unintended charges"
+        # counts provider calls; the ledger is a second, independent account
+        # of the same money that has to agree with it.
+        self.ledger = Ledger(db, clock=self._clock)
         self.gateway = PurchaseGateway(
-            self.engine, self.store, self._execute, audit=self.audit)
+            self.engine, self.store, self._execute, audit=self.audit,
+            ledger=self.ledger)
         self.checkout = CheckoutService(
             self.catalog, self.gateway,
             parser=RuleBasedIntentParser(self.catalog),
@@ -337,7 +346,7 @@ class AdversarialSuite:
             defended=(caused == MANDATE_VELOCITY
                       and len(approved) == MANDATE_VELOCITY
                       and all(r.get("rule") == "VELOCITY_EXCEEDED" for r in denied)),
-            defence="Velocity slot claimed inside one BEGIN IMMEDIATE transaction",
+            defence="Velocity slot claimed under a per-agent Postgres advisory lock",
             evidence=f"{len(approved)} approved, {len(denied)} denied "
                      f"(all VELOCITY_EXCEEDED), {caused} charges",
             money_actions=caused,
@@ -564,7 +573,7 @@ class AdversarialSuite:
 
     def attack_audit_tampering(self) -> AttackOutcome:
         """Erase the evidence after being denied."""
-        import sqlite3
+        import psycopg
 
         agent = self._agent("eraser")
         pending = self._display("SKU-MUG", agent)
@@ -572,20 +581,21 @@ class AdversarialSuite:
         before_entries = len(self.audit.all())
 
         blocked, errors = 0, []
-        conn = sqlite3.connect(self.audit.db_path)
         statements = [
             "UPDATE audit_log SET reason = 'nothing to see here'",
             "UPDATE audit_log SET rule = NULL WHERE rule IS NOT NULL",
             "DELETE FROM audit_log WHERE event_type = 'POLICY_DENIED'",
             "DELETE FROM audit_log",
+            # Postgres-specific: TRUNCATE skips row triggers entirely.
+            "TRUNCATE audit_log",
         ]
-        for sql in statements:
-            try:
-                conn.execute(sql)
-            except sqlite3.IntegrityError as exc:
-                blocked += 1
-                errors.append(str(exc))
-        conn.close()
+        with self.db.outside_connection() as conn:
+            for sql in statements:
+                try:
+                    conn.execute(sql)
+                except psycopg.IntegrityError as exc:
+                    blocked += 1
+                    errors.append(str(exc).splitlines()[0])
         after_entries = len(self.audit.all())
 
         return AttackOutcome(
@@ -596,7 +606,8 @@ class AdversarialSuite:
             expected="Every statement rejected; the record is unchanged",
             defended=(blocked == len(statements)
                       and after_entries == before_entries),
-            defence="BEFORE UPDATE / BEFORE DELETE triggers RAISE(ABORT)",
+            defence="BEFORE UPDATE / DELETE / TRUNCATE triggers raise "
+                    "restrict_violation",
             evidence=f"{blocked}/{len(statements)} statements aborted; "
                      f"{after_entries} entries intact "
                      f"({errors[0] if errors else 'no error'})",
@@ -660,6 +671,9 @@ class AttackReport:
 
     outcomes: list[AttackOutcome] = field(default_factory=list)
     generated_at: float = field(default_factory=time.time)
+    #: The ledger after every attack ran: whether it balances, and whether the
+    #: revenue it booked equals what the provider was actually asked to charge.
+    books: Optional[dict] = None
 
     @property
     def defended(self) -> int:
@@ -692,6 +706,7 @@ class AttackReport:
                 "unintended_charges": self.unintended_charges,
             },
             "attacks": [o.as_dict() for o in self.outcomes],
+            "books": self.books,
         }
 
     def to_json(self) -> str:
@@ -710,6 +725,19 @@ class AttackReport:
             f"**{self.defended} of {len(self.outcomes)} attacks defended. "
             f"{self.unintended_charges} unintended charges.**",
             "",
+        ]
+        if self.books:
+            b = self.books
+            lines += [
+                f"**Books after every attack: {b['summary']}.** Revenue booked "
+                f"Rs. {b['revenue_paise'] / 100:,.2f}, provider charges "
+                f"Rs. {b['charged_paise'] / 100:,.2f}"
+                f"{' (they agree)' if b['agrees'] else ' (**they disagree**)'}; "
+                f"Rs. {b['exposure_paise'] / 100:,.2f} held in suspense for "
+                f"outcomes still unknown.",
+                "",
+            ]
+        lines += [
             "Every attack below was run against a live stack through the HTTP "
             "API, under this mandate:",
             "",
@@ -745,6 +773,18 @@ class AttackReport:
         return "\n".join(lines)
 
 
-def run_suite(tmpdir: str, clock: Optional[Callable[[], float]] = None) -> AttackReport:
-    suite = AdversarialSuite(tmpdir, clock=clock)
-    return AttackReport(outcomes=suite.run_all())
+def run_suite(db: Database, clock: Optional[Callable[[], float]] = None) -> AttackReport:
+    suite = AdversarialSuite(db, clock=clock)
+    outcomes = suite.run_all()
+    report = suite.ledger.verify()
+    revenue = -suite.ledger.trial_balance()[REVENUE]
+    with suite._exec_lock:
+        charged = sum(r.amount_paise for r in suite.executed)
+    return AttackReport(outcomes=outcomes, books={
+        "balanced": report.balanced,
+        "summary": report.summary,
+        "revenue_paise": revenue,
+        "charged_paise": charged,
+        "exposure_paise": suite.ledger.exposure(),
+        "agrees": report.balanced and revenue == charged,
+    })

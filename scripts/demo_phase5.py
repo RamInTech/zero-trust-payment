@@ -5,19 +5,19 @@
 No credentials needed. Every ">>> EXECUTED" is a real money action.
 """
 
-import os
 import time
 
 from zerotrust.audit import AuditLog
 from zerotrust.catalog import demo_catalog
 from zerotrust.checkout import CheckoutError, CheckoutService
+from zerotrust.db import Database
 from zerotrust.gateway import PurchaseGateway
 from zerotrust.idempotency import IdempotencyStore
 from zerotrust.intent import ParsedIntent, RuleBasedIntentParser
 from zerotrust.mandate import Mandate, MandateStore
 from zerotrust.policy import PolicyEngine
 
-DBS = ["demo_phase5_audit.db", "demo_phase5_policy.db", "demo_phase5_idem.db"]
+SCHEMA = "demo_phase5"
 HOUR = 3600.0
 AGENT = "agent_alpha"
 
@@ -37,14 +37,11 @@ def banner(n, title):
 
 
 def main():
-    for base in DBS:
-        for suffix in ("", "-wal", "-shm"):
-            if os.path.exists(base + suffix):
-                os.remove(base + suffix)
+    db = Database.fresh(SCHEMA)
 
     catalog = demo_catalog()
-    audit = AuditLog(DBS[0])
-    engine = PolicyEngine(MandateStore(DBS[1]))
+    audit = AuditLog(db)
+    engine = PolicyEngine(MandateStore(db))
     executed = []
 
     def execute(request):
@@ -53,7 +50,7 @@ def main():
               f"Rs.{request.amount_paise / 100:,.2f}")
         return {"order_id": f"order_{len(executed):04d}"}
 
-    gateway = PurchaseGateway(engine, IdempotencyStore(DBS[2]), execute,
+    gateway = PurchaseGateway(engine, IdempotencyStore(db), execute,
                               audit=audit)
     checkout = CheckoutService(catalog, gateway,
                                parser=RuleBasedIntentParser(catalog), audit=audit)

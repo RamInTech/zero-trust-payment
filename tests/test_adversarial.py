@@ -36,13 +36,13 @@ REQUIRED_COVERAGE = {
 
 
 @pytest.fixture(scope="module")
-def report(tmp_path_factory):
+def report(module_db):
     """One run for the whole module.
 
     The attacks are stateful -- several of them charge -- so re-running per
     test would be slow and would change what the velocity rows mean.
     """
-    return run_suite(str(tmp_path_factory.mktemp("adversarial")))
+    return run_suite(module_db)
 
 
 def test_every_attack_is_defended(report):
@@ -75,6 +75,20 @@ def test_no_unintended_charges(report):
                     for o in report.outcomes
                     if o.money_actions != o.intended_actions)
     )
+
+
+def test_the_books_agree_with_the_charges(report):
+    """A second, independent account of the same money.
+
+    "0 unintended charges" counts provider calls. The ledger books revenue
+    through a different path entirely, so after fourteen attacks -- replays,
+    races, a timeout retried five times -- the two must still agree exactly.
+    """
+    books = report.books
+    assert books is not None
+    assert books["balanced"], books["summary"]
+    assert books["revenue_paise"] == books["charged_paise"], books
+    assert books["agrees"]
 
 
 def test_nothing_breached(report):
@@ -125,7 +139,7 @@ def test_outcomes_carry_usable_evidence(report):
         assert o.status in ("DEFENDED", "BREACHED")
 
 
-def test_attacks_are_order_independent(tmp_path):
+def test_attacks_are_order_independent(db_factory):
     """Each attack must stand alone.
 
     Attacks that charge consume velocity budget. When they shared one agent, a
@@ -137,9 +151,7 @@ def test_attacks_are_order_independent(tmp_path):
         order = AdversarialSuite.ATTACK_METHODS[:]
         random.Random(seed).shuffle(order)
 
-        workdir = tmp_path / f"shuffle_{seed}"
-        workdir.mkdir()
-        suite = AdversarialSuite(str(workdir))
+        suite = AdversarialSuite(db_factory())
 
         outcomes = [getattr(suite, name)() for name in order]
         breached = [o.name for o in outcomes if not o.defended]

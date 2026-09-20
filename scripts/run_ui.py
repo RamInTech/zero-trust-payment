@@ -36,9 +36,11 @@ from zerotrust.catalog import demo_catalog
 from zerotrust.e2e import ServerIdentity
 from zerotrust.faults import Fault, FaultInjector
 from zerotrust.checkout import CheckoutService
+from zerotrust.db import Database
 from zerotrust.demo import create_demo_app
 from zerotrust.gateway import PurchaseGateway
 from zerotrust.idempotency import IdempotencyStore
+from zerotrust.ledger import Ledger
 from zerotrust.intent import (
     FallbackIntentParser, GroqIntentParser, RuleBasedIntentParser,
 )
@@ -60,7 +62,6 @@ SWEEP_INTERVAL_SECONDS = 20.0
 def _receipt(request) -> str:
     """One receipt per idempotency key, so the sweep can find the order again."""
     return f"ui_{request.idempotency_key[:18]}"
-DBS = {"audit": "ui_audit.db", "policy": "ui_policy.db", "idem": "ui_idem.db"}
 
 
 def _admin_auth() -> AdminAuth:
@@ -97,9 +98,15 @@ def build(force_simulated: bool = False):
 
     catalog = demo_catalog()
     offline_provider = SimulatedProvider()
-    audit = AuditLog(DBS["audit"])
-    engine = PolicyEngine(MandateStore(DBS["policy"]))
-    store = IdempotencyStore(DBS["idem"])
+    # One Postgres schema for every store (DATABASE_URL, default
+    # dbname=zerotrust). One database is what lets a purchase record and its
+    # ledger posting commit as a single transaction.
+    db = Database.from_env()
+    print(f"  database : Postgres schema {db.schema!r} ({db.dsn})", flush=True)
+    audit = AuditLog(db)
+    engine = PolicyEngine(MandateStore(db))
+    store = IdempotencyStore(db)
+    ledger = Ledger(db)
 
     # The item list is NOT the boundary here; the per-transaction cap is.
     #
@@ -116,7 +123,7 @@ def build(force_simulated: bool = False):
     # SKU_NOT_ALLOWED with its own narrower mandate.
     existing = engine.mandates.active_for_agent(AGENT)
     if existing is not None and ANY_SKU not in existing.allowed_skus:
-        # ui_policy.db persists between runs, so a narrower mandate issued
+        # The schema persists between runs, so a narrower mandate issued
         # before this change would otherwise survive and keep denying items
         # the operator now expects to work. Config in this file wins over
         # whatever is on disk.
@@ -172,7 +179,7 @@ def build(force_simulated: bool = False):
             return offline_provider.create_order(
                 request.amount_paise, receipt=_receipt(request))
 
-    gateway = PurchaseGateway(engine, store, execute, audit=audit)
+    gateway = PurchaseGateway(engine, store, execute, audit=audit, ledger=ledger)
 
     # The agent is a real LLM when one is configured. The fallback is not a
     # nicety: a rate limit or a dropped connection would otherwise take the
@@ -199,7 +206,7 @@ def build(force_simulated: bool = False):
     # itself instead of waiting for somebody to notice.
     reconciler = Reconciler(
         provider if live else offline_provider, store, audit=audit,
-        policy=engine)
+        policy=engine, ledger=ledger)
     scheduler = ReconciliationScheduler(
         reconciler,
         receipt_for=lambda scoped: f"ui_{scoped.split(':', 1)[-1][:18]}",
@@ -222,7 +229,8 @@ def build(force_simulated: bool = False):
                            admin_auth=_admin_auth(),
                            narrator=narrator,
                            payments_mode="razorpay-test" if live else "simulated",
-                           recommender=StaticRecommender(catalog))
+                           recommender=StaticRecommender(catalog),
+                           ledger=ledger)
 
 
 def main() -> int:

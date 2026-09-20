@@ -7,13 +7,12 @@ HTTPS request to Razorpay; count them against the number of submissions.
 Requires .env with rzp_test_ credentials.
 """
 
-import os
-
 from zerotrust.config import MissingCredentialsError, RazorpayConfig
+from zerotrust.db import Database
 from zerotrust.idempotency import IdempotencyStore
 from zerotrust.provider import RazorpayTestModeProvider, SimulatedProvider
 
-DB = "demo_phase2.db"
+SCHEMA = "demo_phase2"
 
 
 class LoudRazorpay(RazorpayTestModeProvider):
@@ -36,11 +35,10 @@ def main():
         print(f"Cannot run: {exc}")
         return
 
-    if os.path.exists(DB):
-        os.remove(DB)
+    db = Database.fresh(SCHEMA)
 
     print(f"Using test-mode key {config.key_id[:14]}... against {config.base_url}")
-    store = IdempotencyStore(DB)
+    store = IdempotencyStore(db)
 
     with LoudRazorpay(config) as rzp:
         # ------------------------------------------------------------------
@@ -94,7 +92,7 @@ def main():
     banner(5, "The wrapper doesn't know which provider it holds")
     print("    Identical retry sequence against the offline simulator.\n")
     sim = SimulatedProvider()
-    sim_store = IdempotencyStore(DB)
+    sim_store = IdempotencyStore(db)
     sim_payload = {"amount_paise": 75_000, "currency": "INR", "receipt": "sim"}
     for i in range(5):
         r = sim_store.execute(

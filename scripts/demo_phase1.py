@@ -2,19 +2,19 @@
 
     uv run python scripts/demo_phase1.py
 
-Leaves demo_phase1.db behind on purpose so you can inspect it with sqlite3
-afterwards. Every "CHARGE" line printed below is real money moving, as far as
-the mock processor is concerned.
+Leaves the demo_phase1 Postgres schema behind on purpose so you can inspect it
+with psql afterwards. Every "CHARGE" line printed below is real money moving,
+as far as the mock processor is concerned.
 """
 
-import os
 import threading
 import time
 
+from zerotrust.db import Database
 from zerotrust.idempotency import IdempotencyStore, Outcome
 from zerotrust.processor import MockPaymentProcessor
 
-DB = "demo_phase1.db"
+SCHEMA = "demo_phase1"
 
 
 class LoudProcessor(MockPaymentProcessor):
@@ -38,10 +38,8 @@ def show(label, result):
 
 
 def main():
-    if os.path.exists(DB):
-        os.remove(DB)
-
-    store = IdempotencyStore(DB, stale_after_seconds=2.0)
+    db = Database.fresh(SCHEMA)
+    store = IdempotencyStore(db, stale_after_seconds=2.0)
     p = LoudProcessor()
     payload = {"order_id": "order_coffee", "amount_paise": 50_000, "currency": "INR"}
     action = lambda: p.charge(payload["order_id"], payload["amount_paise"])
@@ -138,8 +136,8 @@ def main():
     print(f"    Race processor total charges: {racy.charge_count}")
     print(f"\n    Expected: 3 main (coffee, cake, stuck) + 1 race = 4 total.")
     print(f"    Actual:   {p.charge_count + racy.charge_count}")
-    print(f"\n    Inspect the ledger yourself:  sqlite3 {DB} "
-          f"'select key, status, attempts from idempotency_records;'")
+    print(f"\n    Inspect the records yourself:  psql zerotrust -c "
+          f"'select key, status, attempts from {SCHEMA}.idempotency_records;'")
 
 
 if __name__ == "__main__":

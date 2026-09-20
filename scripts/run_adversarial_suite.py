@@ -10,10 +10,11 @@ Exits non-zero if any attack breached, so this is usable as a check and not
 only as a report generator.
 """
 
-import json
+import os
 import sys
-import tempfile
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 from zerotrust.adversary import (
     MANDATE_CAP_PAISE,
@@ -21,6 +22,7 @@ from zerotrust.adversary import (
     MANDATE_VELOCITY,
     run_suite,
 )
+from zerotrust.db import DEFAULT_DSN, Database
 
 DOCS = Path(__file__).resolve().parent.parent / "docs"
 MD_PATH = DOCS / "adversarial-results.md"
@@ -38,8 +40,12 @@ def main() -> int:
     print("\n  Every attack below goes through the HTTP API, except where the")
     print("  row says otherwise.\n")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        report = run_suite(tmpdir)
+    # A scratch schema, dropped afterwards: the attacks need a stack nobody
+    # else has touched, and must never write into the app's own schema.
+    load_dotenv()
+    with Database.temporary(os.environ.get("DATABASE_URL", DEFAULT_DSN),
+                            prefix="adversarial") as db:
+        report = run_suite(db)
 
     for i, outcome in enumerate(report.outcomes, 1):
         marker = ">>>" if outcome.defended else "!!!"

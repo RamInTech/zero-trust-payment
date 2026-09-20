@@ -6,19 +6,18 @@ Runs a handful of purchases, then prints the log and tries to tamper with it.
 The point: everything below is reconstructed from the log alone.
 """
 
-import os
-import sqlite3
 import time
 
+import psycopg
+
 from zerotrust.audit import AuditLog, EventType
+from zerotrust.db import Database
 from zerotrust.gateway import PurchaseGateway
 from zerotrust.idempotency import IdempotencyStore
 from zerotrust.mandate import Mandate, MandateStore
 from zerotrust.policy import PolicyEngine, PurchaseRequest
 
-AUDIT_DB = "demo_phase4_audit.db"
-POLICY_DB = "demo_phase4_policy.db"
-IDEM_DB = "demo_phase4_idem.db"
+SCHEMA = "demo_phase4"
 HOUR = 3600.0
 
 
@@ -27,15 +26,12 @@ def banner(title):
 
 
 def main():
-    for base in (AUDIT_DB, POLICY_DB, IDEM_DB):
-        for suffix in ("", "-wal", "-shm"):
-            if os.path.exists(base + suffix):
-                os.remove(base + suffix)
+    db = Database.fresh(SCHEMA)
 
-    audit = AuditLog(AUDIT_DB)
-    mandates = MandateStore(POLICY_DB)
+    audit = AuditLog(db)
+    mandates = MandateStore(db)
     policy = PolicyEngine(mandates)
-    store = IdempotencyStore(IDEM_DB)
+    store = IdempotencyStore(db)
     executed = []
 
     mandates.issue(Mandate(
@@ -83,19 +79,19 @@ def main():
     print("\n    Note: none of that required reading the source code.")
 
     banner("TRYING TO TAMPER WITH HISTORY")
-    conn = sqlite3.connect(AUDIT_DB)
-    for sql in (
-        "UPDATE audit_log SET reason = 'looked fine to me'",
-        "UPDATE audit_log SET rule = NULL WHERE rule IS NOT NULL",
-        "DELETE FROM audit_log WHERE event_type = 'POLICY_DENIED'",
-        "DELETE FROM audit_log",
-    ):
-        try:
-            conn.execute(sql)
-            print(f"    !!! SUCCEEDED (should not happen): {sql}")
-        except sqlite3.IntegrityError as exc:
-            print(f"    blocked: {sql[:46]:<48} -> {exc}")
-    conn.close()
+    with db.outside_connection() as conn:
+        for sql in (
+            "UPDATE audit_log SET reason = 'looked fine to me'",
+            "UPDATE audit_log SET rule = NULL WHERE rule IS NOT NULL",
+            "DELETE FROM audit_log WHERE event_type = 'POLICY_DENIED'",
+            "DELETE FROM audit_log",
+            "TRUNCATE audit_log",
+        ):
+            try:
+                conn.execute(sql)
+                print(f"    !!! SUCCEEDED (should not happen): {sql}")
+            except psycopg.IntegrityError as exc:
+                print(f"    blocked: {sql[:46]:<48} -> {str(exc).splitlines()[0]}")
 
     print(f"\n    Entries still present: {len(audit.all())}")
     print("    The database refuses, not the application. Even raw SQL cannot")

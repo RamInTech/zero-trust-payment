@@ -6,16 +6,16 @@ No credentials needed; the executor is a local stub. Every ">>> EXECUTED" line
 is the money action actually running. Count them: a denial must produce none.
 """
 
-import os
 import threading
 import time
 
+from zerotrust.db import Database
 from zerotrust.gateway import PurchaseGateway
 from zerotrust.idempotency import IdempotencyStore
 from zerotrust.mandate import Mandate, MandateStore
 from zerotrust.policy import PolicyEngine, PurchaseRequest
 
-DB = "demo_phase3.db"
+SCHEMA = "demo_phase3"
 HOUR = 3600.0
 
 
@@ -35,14 +35,12 @@ def banner(n, title):
 
 
 def main():
-    for f in (DB, f"{DB}-wal", f"{DB}-shm", "demo_phase3_idem.db"):
-        if os.path.exists(f):
-            os.remove(f)
+    db = Database.fresh(SCHEMA)
 
     clock = Clock()
-    mandates = MandateStore(DB, clock=clock)
+    mandates = MandateStore(db, clock=clock)
     policy = PolicyEngine(mandates, clock=clock)
-    store = IdempotencyStore("demo_phase3_idem.db")
+    store = IdempotencyStore(db)
 
     executed = []
 

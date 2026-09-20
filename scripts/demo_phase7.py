@@ -6,10 +6,10 @@ No credentials needed; uses the offline provider. Every ">>> ORDER CREATED"
 line is money moving as far as the provider is concerned.
 """
 
-import os
 import time
 
 from zerotrust.audit import AuditLog
+from zerotrust.db import Database
 from zerotrust.faults import Fault, FaultInjector, InjectedCrash
 from zerotrust.gateway import PurchaseGateway
 from zerotrust.idempotency import IdempotencyStore, Outcome
@@ -18,7 +18,7 @@ from zerotrust.policy import PolicyEngine, PurchaseRequest
 from zerotrust.provider import ProviderTimeout, SimulatedProvider
 from zerotrust.reconcile import DEFAULT_NOT_FOUND_GRACE_SECONDS, Reconciler
 
-DBS = ["demo_phase7_audit.db", "demo_phase7_policy.db", "demo_phase7_idem.db"]
+SCHEMA = "demo_phase7"
 HOUR = 3600.0
 AGENT = "agent_alpha"
 
@@ -39,17 +39,14 @@ def banner(n, title):
 
 
 def main():
-    for base in DBS:
-        for suffix in ("", "-wal", "-shm"):
-            if os.path.exists(base + suffix):
-                os.remove(base + suffix)
+    db = Database.fresh(SCHEMA)
 
     clock = Clock()
     provider = SimulatedProvider()
     faults = FaultInjector()
-    audit = AuditLog(DBS[0], clock=clock)
-    engine = PolicyEngine(MandateStore(DBS[1], clock=clock), clock=clock)
-    store = IdempotencyStore(DBS[2], clock=clock)
+    audit = AuditLog(db, clock=clock)
+    engine = PolicyEngine(MandateStore(db, clock=clock), clock=clock)
+    store = IdempotencyStore(db, clock=clock)
 
     engine.mandates.issue(Mandate(
         agent_id=AGENT, max_amount_paise=50_000,
