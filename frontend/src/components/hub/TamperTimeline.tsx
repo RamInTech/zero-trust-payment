@@ -6,14 +6,14 @@ import { api } from "@/api"
 import { cn } from "@/lib/utils"
 
 /**
- * Four raw SQL statements, run one at a time against the live audit database,
+ * Raw SQL statements, run one at a time against the live audit table,
  * bypassing the application entirely -- and the entry count that never moves.
  *
  * This is the strongest card in the Hub precisely because it is not "our code
- * checks permissions" -- it is "even a direct sqlite3 connection cannot do
- * this", enforced by BEFORE UPDATE / BEFORE DELETE triggers on the table
+ * checks permissions" -- it is "even a direct Postgres connection cannot do
+ * this", enforced by BEFORE UPDATE / DELETE / TRUNCATE triggers on the table
  * itself. Revealing one statement at a time, with a pause, is what makes that
- * legible on video instead of a single instant "4/4 blocked" line.
+ * legible on video instead of a single instant "all blocked" line.
  */
 export function TamperTimeline({ onChanged }: { onChanged?: () => void } = {}) {
   const [attempts, setAttempts] = useState<any[]>([])

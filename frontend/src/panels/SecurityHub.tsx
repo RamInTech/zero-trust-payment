@@ -15,6 +15,7 @@ import { KillSwitch } from "@/components/hub/KillSwitch"
 import { WebhookVerification } from "@/components/hub/WebhookVerification"
 import { AdminAuthProbe } from "@/components/hub/AdminAuthProbe"
 import { AuditWriteBlocksPayment } from "@/components/hub/AuditWriteBlocksPayment"
+import { DoubleEntryLedger } from "@/components/hub/DoubleEntryLedger"
 import { cn } from "@/lib/utils"
 
 type DemoProps = { freshAgent: () => Promise<string>; onChanged?: () => void }
@@ -34,6 +35,7 @@ const DEMONSTRATIONS: Record<string, React.ComponentType<DemoProps>> = {
   confirmation: VelocityBurst,
   append_only_audit: TamperTimeline,
   audit_before_payment: AuditWriteBlocksPayment,
+  double_entry_ledger: DoubleEntryLedger,
   webhook_verification: WebhookVerification,
   admin_auth: AdminAuthProbe,
   price_revalidation: PriceSwap,

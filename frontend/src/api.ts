@@ -144,6 +144,8 @@ export const api = {
   tamper: () => post("/demo/tamper-audit"),
   chainBreakDemo: () => post("/demo/audit/chain-break"),
   auditWriteBlocksPaymentDemo: () => post("/demo/audit/write-blocks-payment"),
+  ledger: (limit = 20) => call(`/demo/ledger?limit=${limit}`),
+  ledgerImbalanceDemo: () => post("/demo/ledger/imbalance"),
   armTimeout: () => post("/demo/fault/timeout"),
   compromiseParser: (enabled: boolean) =>
     post(`/demo/parser/compromise?enabled=${enabled}`),

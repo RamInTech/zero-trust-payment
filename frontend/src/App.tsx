@@ -61,13 +61,17 @@ export default function App() {
     { id: 1, kind: "agent", text: "What would you like to buy?" },
   ])
   const [sweep, setSweep] = useState<Json | null>(null)
+  const [ledger, setLedger] = useState<Json | null>(null)
   const [tab, setTab] = useState("chat")
 
   const refresh = useCallback(async (who = agent) => {
-    const [m, s, a, t, l, w, c] = await Promise.all([
+    const [m, s, a, t, l, w, c, g] = await Promise.all([
       api.mandate(who), api.stats(), api.audit(), api.transactions(), api.layers(),
-      api.sweep(), api.catalog(),
+      api.sweep(), api.catalog(), api.ledger(),
     ])
+    // 501 when the server keeps no books: the Books panel then stays hidden
+    // rather than rendering an empty ledger as if one existed.
+    setLedger(g.ok ? g.body : null)
     if (m.ok) setMandate(m.body)
     if (s.ok) setStats(s.body)
     if (a.ok) setAudit(a.body.events)
@@ -240,7 +244,8 @@ export default function App() {
                 </TabsContent>
                 <TabsContent value="dashboard" className="focus-visible:outline-none">
                   <Dashboard mandate={mandate} stats={stats} audit={audit} sweep={sweep}
-                             agent={agent} catalog={catalog} onChanged={() => refresh()} />
+                             agent={agent} catalog={catalog} ledger={ledger}
+                             onChanged={() => refresh()} />
                 </TabsContent>
                 <TabsContent value="checkout" className="focus-visible:outline-none">
                   <Checkout agent={agent} catalog={catalog} onChanged={() => refresh()} />

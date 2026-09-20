@@ -15,10 +15,10 @@ import {
 import type { Json } from "@/api"
 
 export function Dashboard({
-  mandate, stats, audit, sweep, agent, catalog, onChanged,
+  mandate, stats, audit, sweep, agent, catalog, ledger, onChanged,
 }: {
   mandate: Json | null; stats: Json | null; audit: Json[]; sweep: Json | null
-  agent: string; catalog: Json[]; onChanged: () => void
+  agent: string; catalog: Json[]; ledger: Json | null; onChanged: () => void
 }) {
   const denials = (stats?.denials ?? {}) as Record<string, number>
   const expiryHours = mandate ? Math.floor(mandate.seconds_until_expiry / 3600) : 0
@@ -148,6 +148,8 @@ export function Dashboard({
       <CatalogManager catalog={catalog} onChanged={onChanged}
                        isAdmin={isAdmin} onUnauthorized={onUnauthorized} />
 
+      <BooksPanel ledger={ledger} />
+
       <div className="grid gap-4 lg:grid-cols-3">
         <Card className="lg:col-span-2">
           <CardHeader><CardTitle>Recent decisions</CardTitle></CardHeader>
@@ -215,6 +217,127 @@ export function Dashboard({
         </Card>
       </div>
     </div>
+  )
+}
+
+
+const ACCOUNT_LABELS: Record<string, string> = {
+  "assets:razorpay_clearing": "Razorpay clearing",
+  "revenue:sales": "Sales revenue",
+  "suspense:unverified_clearing": "Unverified clearing (suspense)",
+  "suspense:unverified_revenue": "Unverified revenue (suspense)",
+}
+
+const KIND_LABELS: Record<string, string> = {
+  SALE: "Sale",
+  UNVERIFIED: "Outcome unknown",
+  SUSPENSE_REVERSED: "Suspense reversed",
+  RESOLVED: "Settled: not executed",
+}
+
+/** A balance with its side named, since a bare negative number in a ledger
+ *  reads as an error rather than as a credit. */
+function signedBalance(paise: number): string {
+  if (paise === 0) return rupees(0)
+  return `${paise > 0 ? "Dr" : "Cr"} ${rupees(Math.abs(paise))}`
+}
+
+/**
+ * The books, read straight from the ledger.
+ *
+ * Every figure here is a SUM over postings -- nothing is a stored balance --
+ * and each posting is shown as the debit and credit lines it actually wrote,
+ * so a reader can add a row up themselves rather than trust the total.
+ */
+function BooksPanel({ ledger }: { ledger: Json | null }) {
+  if (!ledger) return null
+  const verify = ledger.verify
+  const discrepancies = (ledger.discrepancies ?? []) as Json[]
+
+  return (
+    <Card>
+      <CardHeader>
+        <div>
+          <CardTitle>Books</CardTitle>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            Double-entry: every posting's lines sum to zero, and balances are
+            summed from history, never stored.
+          </p>
+        </div>
+        <Badge variant={verify.balanced ? "ok" : "danger"} dot>{verify.summary}</Badge>
+      </CardHeader>
+      <CardContent className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
+        <div>
+          <div className="label mb-1.5">Balances</div>
+          <Rows>
+            {Object.entries(ledger.trial_balance as Record<string, number>).map(([account, paise]) => (
+              <Row key={account} label={ACCOUNT_LABELS[account] ?? account}
+                   value={<span className="mono tabular-nums">{signedBalance(paise)}</span>} />
+            ))}
+            <Row label="Exposure to unknown outcomes"
+                 value={<span className="mono tabular-nums">{rupees(ledger.exposure_paise)}</span>} />
+            <Row label="Disagreements with purchase records"
+                 value={String(discrepancies.length)}
+                 tone={discrepancies.length > 0 ? "danger" : undefined} />
+            <Row label="Purchases from before the books began"
+                 value={String(ledger.purchases_before_the_books ?? 0)} />
+          </Rows>
+        </div>
+
+        <div className="min-w-0">
+          <div className="label mb-1.5">Recent postings</div>
+          {ledger.recent.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No postings yet.</p>
+          ) : (
+            <div className="max-h-80 overflow-auto rounded-md border border-border">
+              <table className="w-full text-left text-xs">
+                <thead className="sticky top-0 bg-card">
+                  <tr className="border-b border-border">
+                    <th className="label px-3 py-2 font-medium">#</th>
+                    <th className="label px-3 py-2 font-medium">Posting</th>
+                    <th className="label px-3 py-2 font-medium">Account</th>
+                    <th className="label px-3 py-2 text-right font-medium">Debit</th>
+                    <th className="label px-3 py-2 text-right font-medium">Credit</th>
+                  </tr>
+                </thead>
+                {(ledger.recent as Json[]).map(txn => (
+                  <tbody key={txn.txn_id} className="border-b border-border last:border-b-0">
+                    {txn.lines.length === 0 ? (
+                      <tr>
+                        <td className="mono px-3 py-1.5 text-faint">{txn.txn_id}</td>
+                        <td className="px-3 py-1.5 text-foreground">{KIND_LABELS[txn.kind] ?? txn.kind}</td>
+                        <td colSpan={3} className="px-3 py-1.5 text-faint">
+                          no lines — a marker that this attempt never moved money
+                        </td>
+                      </tr>
+                    ) : (txn.lines as Json[]).map((line, i) => (
+                      <tr key={i}>
+                        <td className="mono px-3 py-1.5 text-faint">{i === 0 ? txn.txn_id : ""}</td>
+                        <td className="px-3 py-1.5 text-foreground">
+                          {i === 0 ? (KIND_LABELS[txn.kind] ?? txn.kind) : ""}
+                          {i === 0 && txn.reverses_txn_id != null && (
+                            <span className="text-faint"> of #{txn.reverses_txn_id}</span>
+                          )}
+                        </td>
+                        <td className="px-3 py-1.5 text-muted-foreground">
+                          {ACCOUNT_LABELS[line.account] ?? line.account}
+                        </td>
+                        <td className="mono px-3 py-1.5 text-right tabular-nums">
+                          {line.amount_paise > 0 ? rupees(line.amount_paise) : ""}
+                        </td>
+                        <td className="mono px-3 py-1.5 text-right tabular-nums">
+                          {line.amount_paise < 0 ? rupees(-line.amount_paise) : ""}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                ))}
+              </table>
+            </div>
+          )}
+        </div>
+      </CardContent>
+    </Card>
   )
 }
 
