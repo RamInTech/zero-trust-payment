@@ -38,15 +38,15 @@ def catalog():
 
 
 @pytest.fixture
-def env(tmp_path, catalog):
-    audit = AuditLog(str(tmp_path / "audit.db"))
-    engine = PolicyEngine(MandateStore(str(tmp_path / "policy.db")))
+def env(db, catalog):
+    audit = AuditLog(db)
+    engine = PolicyEngine(MandateStore(db))
     engine.mandates.issue(Mandate(
         agent_id=AGENT, max_amount_paise=50_000,
         allowed_skus=frozenset({ANY_SKU}),
         expires_at=time.time() + 24 * HOUR, velocity_limit=20,
         velocity_window_secs=HOUR))
-    store = IdempotencyStore(str(tmp_path / "idem.db"))
+    store = IdempotencyStore(db)
     calls = []
 
     def execute(request):
@@ -149,10 +149,10 @@ def test_every_offer_is_logged(env):
     assert offered[0].details["prompted_by_sku"] == "SKU-COFFEE"
 
 
-def test_a_server_without_a_recommender_says_so(tmp_path, catalog):
-    audit = AuditLog(str(tmp_path / "a.db"))
-    engine = PolicyEngine(MandateStore(str(tmp_path / "p.db")))
-    store = IdempotencyStore(str(tmp_path / "i.db"))
+def test_a_server_without_a_recommender_says_so(db, catalog):
+    audit = AuditLog(db)
+    engine = PolicyEngine(MandateStore(db))
+    store = IdempotencyStore(db)
     gateway = PurchaseGateway(engine, store, lambda r: {}, audit=audit)
     checkout = CheckoutService(catalog, gateway, audit=audit)
     client = TestClient(create_app(checkout))
@@ -198,21 +198,21 @@ def test_a_suggested_item_over_the_cap_is_still_denied(env):
     assert env["calls"] == []
 
 
-def test_suggestions_are_not_pre_filtered_by_the_mandate(tmp_path, catalog):
+def test_suggestions_are_not_pre_filtered_by_the_mandate(db, catalog):
     """Deliberate: the recommender proposes, the policy engine decides.
 
     Filtering here would put the mandate in two places, and the recommender's
     copy would be the one no adversarial test attacks. So an unaffordable
     complement is still offered -- and still refused downstream.
     """
-    audit = AuditLog(str(tmp_path / "audit.db"))
-    engine = PolicyEngine(MandateStore(str(tmp_path / "policy.db")))
+    audit = AuditLog(db)
+    engine = PolicyEngine(MandateStore(db))
     engine.mandates.issue(Mandate(
         agent_id=AGENT, max_amount_paise=100,       # Rs.1 -- affords nothing
         allowed_skus=frozenset({ANY_SKU}),
         expires_at=time.time() + HOUR, velocity_limit=5,
         velocity_window_secs=HOUR))
-    store = IdempotencyStore(str(tmp_path / "idem.db"))
+    store = IdempotencyStore(db)
     gateway = PurchaseGateway(engine, store, lambda r: {"order_id": "o"}, audit=audit)
     checkout = CheckoutService(catalog, gateway, audit=audit)
     client = TestClient(create_app(checkout, recommender=StaticRecommender(catalog)))

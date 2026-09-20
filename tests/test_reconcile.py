@@ -65,17 +65,17 @@ def faults():
 
 
 @pytest.fixture
-def stack(tmp_path, clock, provider, faults):
+def stack(db, clock, provider, faults):
     """A full stack whose executor can be made to fail on demand."""
-    audit = AuditLog(str(tmp_path / "audit.db"), clock=clock)
-    engine = PolicyEngine(MandateStore(str(tmp_path / "policy.db"), clock=clock),
+    audit = AuditLog(db, clock=clock)
+    engine = PolicyEngine(MandateStore(db, clock=clock),
                           clock=clock)
     engine.mandates.issue(Mandate(
         agent_id=AGENT, max_amount_paise=50_000,
         allowed_skus=frozenset({"SKU-COFFEE"}),
         expires_at=clock() + 24 * HOUR, velocity_limit=3,
         velocity_window_secs=HOUR, created_at=clock()))
-    store = IdempotencyStore(str(tmp_path / "idem.db"), clock=clock)
+    store = IdempotencyStore(db, clock=clock)
 
     def execute(request: PurchaseRequest) -> dict:
         if faults.fire_once(Fault.PROVIDER_TIMEOUT):

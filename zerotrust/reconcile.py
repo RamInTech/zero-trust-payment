@@ -45,7 +45,9 @@ from zerotrust.idempotency import (
     PENDING_VERIFICATION,
     PROCESSING,
     IdempotencyStore,
+    scope_key,
 )
+from zerotrust.ledger import Ledger, require_shared_database
 from zerotrust.policy import PolicyEngine
 from zerotrust.provider import PaymentProvider, ProviderError, ProviderTimeout
 
@@ -53,6 +55,14 @@ from zerotrust.provider import PaymentProvider, ProviderError, ProviderTimeout
 #: Verified against Razorpay test mode, where a freshly created order is still
 #: missing from the order list after 5 seconds.
 DEFAULT_NOT_FOUND_GRACE_SECONDS = 300.0
+
+
+def _unscope(scoped: str) -> tuple[Optional[str], str]:
+    """Split a stored `agent:key` back into (agent_id, key)."""
+    agent_id, _, key = scoped.partition(":")
+    if not key:  # unscoped key
+        return None, scoped
+    return agent_id, key
 
 
 class Finding(str, Enum):
@@ -109,11 +119,20 @@ class Reconciler:
         policy: Optional[PolicyEngine] = None,
         clock: Callable[[], float] = time.time,
         not_found_grace_seconds: float = DEFAULT_NOT_FOUND_GRACE_SECONDS,
+        ledger: Optional[Ledger] = None,
     ) -> None:
         self.provider = provider
         self.store = store
         self.audit = audit
         self.policy = policy
+        self.ledger = ledger
+        require_shared_database(ledger, store.db, "Reconciler")
+        #: Keys the ledger-repair pass sent for human review. Not retried by
+        #: that pass again in this process: every retry that still cannot
+        #: decide writes another permanent DIVERGENCE_DETECTED entry, and the
+        #: discrepancy stays visible on the books regardless.
+        self._needs_human: set[str] = set()
+        self._flag_lock = threading.Lock()
         self._clock = clock
         self.not_found_grace_seconds = not_found_grace_seconds
 
@@ -209,8 +228,16 @@ class Reconciler:
                        "failure was real and a retry is safe",
             )
             if local_status == PENDING_VERIFICATION:
-                self.store.resolve_not_executed(key, agent_id=agent_id)
+                # The status change and the suspense reversal commit together.
+                self.store.resolve_not_executed(
+                    key, agent_id=agent_id,
+                    also=lambda conn, _attempts: self._book_not_executed(
+                        key, agent_id, record, request_id, conn=conn))
                 self._release_slot(agent_id, key)
+            elif local_status == FAILED:
+                # A record already settled in the store can still hold open
+                # suspense, if the gateway froze it without managing to post.
+                self._book_not_executed(key, agent_id, record, request_id)
             self._log(EventType.DIVERGENCE_RESOLVED, Actor.SYSTEM, result,
                       request_id)
             return result
@@ -237,7 +264,10 @@ class Reconciler:
 
         if local_status == COMPLETED:
             # Both sides agree. A detector that cried wolf here would be worse
-            # than useless, so this path is explicitly a non-event.
+            # than useless, so this path is explicitly a non-event -- except
+            # for the books: if the sale was never posted (the write failed
+            # after the charge), this is where it gets booked. Idempotent.
+            self._book_sale(key, agent_id, order, record, request_id)
             return ReconcileResult(
                 finding=Finding.CONSISTENT,
                 key=key, agent_id=agent_id, receipt=receipt,
@@ -260,7 +290,12 @@ class Reconciler:
             request_id,
         )
 
-        self.store.resolve_verified(key, order, agent_id=agent_id)
+        # The repaired status and the sale commit together, so the books can
+        # never show a sale on a record that still says it failed, or the reverse.
+        self.store.resolve_verified(
+            key, order, agent_id=agent_id,
+            also=lambda conn, _attempts: self._book_sale(
+                key, agent_id, order, record, request_id, conn=conn))
         self._confirm_slot(agent_id, key)
 
         result = ReconcileResult(
@@ -285,15 +320,60 @@ class Reconciler:
         results = []
         for row in self.store.pending_verification():
             scoped = row["key"]
-            agent_id, _, key = scoped.partition(":")
-            if not key:  # unscoped key
-                agent_id, key = None, scoped
+            agent_id, key = _unscope(scoped)
             results.append(
                 self.reconcile(key, receipt_for(scoped), agent_id=agent_id)
             )
         return results
 
+    #: Gaps a reconcile can close: it books the sale (CONSISTENT, or a repaired
+    #: divergence) or settles open suspense. The other two problems the
+    #: ledger reports -- a sale on a key that never completed, a pending key
+    #: with no suspense -- need a decision or an amount this cannot supply, so
+    #: they are reported and left alone rather than retried every cycle.
+    REPAIRABLE = frozenset({"missing_sale", "open_suspense_not_pending"})
+
+    def repair_ledger(self, receipt_for: Callable[[str], str]) -> list[ReconcileResult]:
+        """Reconcile every key the books disagree with the store about."""
+        if self.ledger is None:
+            return []
+        results = []
+        with self._flag_lock:
+            already_flagged = set(self._needs_human)
+        keys = {d["key"] for d in self.ledger.discrepancies(self.store.records())
+                if d["problem"] in self.REPAIRABLE} - already_flagged
+        for scoped in sorted(keys):
+            agent_id, key = _unscope(scoped)
+            result = self.reconcile(key, receipt_for(scoped), agent_id=agent_id)
+            if result.needs_human:
+                with self._flag_lock:
+                    self._needs_human.add(scoped)
+            results.append(result)
+        return results
+
     # -- helpers -----------------------------------------------------------
+
+    def _book_sale(self, key: str, agent_id: Optional[str], order: dict,
+                   record, request_id: Optional[str], conn=None) -> None:
+        if self.ledger is None:
+            return
+        amount = order.get("amount")
+        if type(amount) is not int:  # noqa: E721
+            # No amount from the provider means nothing to book honestly.
+            # Leaving the gap is visible in discrepancies(); guessing is not.
+            return
+        self.ledger.record_sale(
+            scope_key(key, agent_id), amount,
+            attempt=record["attempts"] if record else 1,
+            agent_id=agent_id, request_id=request_id, conn=conn)
+
+    def _book_not_executed(self, key: str, agent_id: Optional[str], record,
+                           request_id: Optional[str], conn=None) -> None:
+        if self.ledger is None or record is None:
+            return
+        self.ledger.record_not_executed(
+            scope_key(key, agent_id), attempt=record["attempts"],
+            agent_id=agent_id, request_id=request_id, conn=conn)
 
     def _confirm_slot(self, agent_id: Optional[str], key: str) -> None:
         if self.policy and agent_id:
@@ -387,6 +467,10 @@ class ReconciliationScheduler:
         seen = 0
         try:
             results = self.reconciler.sweep(self.receipt_for)
+            # Then the books: a sale whose posting failed after the charge
+            # would otherwise never be looked at again, since its record is
+            # COMPLETED and the sweep only visits pending ones.
+            results += self.reconciler.repair_ledger(self.receipt_for)
             seen = len(results)
             for result in results:
                 key = result.finding.value

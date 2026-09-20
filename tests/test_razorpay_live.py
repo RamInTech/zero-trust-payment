@@ -78,9 +78,9 @@ def test_bad_amount_is_rejected_by_razorpay(provider):
 
 # -- COMPLETION BULLET 2 ---------------------------------------------------
 
-def test_repeated_key_does_not_create_a_duplicate_order(tmp_path, provider):
+def test_repeated_key_does_not_create_a_duplicate_order(db, provider):
     """The Phase 1 wrapper, unchanged, around a real provider."""
-    store = IdempotencyStore(str(tmp_path / "live.db"))
+    store = IdempotencyStore(db)
     receipt = _receipt()
     payload = {"amount_paise": 50_000, "currency": "INR", "receipt": receipt}
     key = f"live-key-{uuid.uuid4().hex[:8]}"
@@ -168,7 +168,7 @@ def test_live_order_list_lags_behind_creation(provider):
 
 
 def test_live_reconciler_refuses_to_guess_when_the_order_is_not_yet_visible(
-    tmp_path, provider
+    db, provider
 ):
     """The full Phase 7 scenario against a REAL Razorpay order.
 
@@ -187,13 +187,13 @@ def test_live_reconciler_refuses_to_guess_when_the_order_is_not_yet_visible(
 
     receipt = _receipt()
     faults = FaultInjector().arm(Fault.CRASH_AFTER_PROVIDER_CALL)
-    audit = AuditLog(str(tmp_path / "audit.db"))
-    engine = PolicyEngine(MandateStore(str(tmp_path / "policy.db")))
+    audit = AuditLog(db)
+    engine = PolicyEngine(MandateStore(db))
     engine.mandates.issue(Mandate(
         agent_id="agent_live", max_amount_paise=50_000,
         allowed_skus=frozenset({"SKU-COFFEE"}),
         expires_at=time.time() + 3600, velocity_limit=3))
-    store = IdempotencyStore(str(tmp_path / "idem.db"))
+    store = IdempotencyStore(db)
     created_ids = []
 
     def execute(request):

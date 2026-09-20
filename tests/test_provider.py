@@ -214,7 +214,7 @@ def _retry_sequence(store, provider, key, retries=4):
     ]
 
 
-def test_wrapper_behaviour_is_identical_for_real_and_simulated(tmp_path):
+def test_wrapper_behaviour_is_identical_for_real_and_simulated(db_factory):
     """Phase 1's wrapper is unchanged and provider-agnostic.
 
     The same retry sequence, run against a real-HTTP provider and an offline
@@ -229,8 +229,8 @@ def test_wrapper_behaviour_is_identical_for_real_and_simulated(tmp_path):
     razorpay = stub_provider(handler)
     simulated = SimulatedProvider()
 
-    real_store = IdempotencyStore(str(tmp_path / "real.db"))
-    sim_store = IdempotencyStore(str(tmp_path / "sim.db"))
+    real_store = IdempotencyStore(db_factory())
+    sim_store = IdempotencyStore(db_factory())
 
     real_results = _retry_sequence(real_store, razorpay, "key-real")
     sim_results = _retry_sequence(sim_store, simulated, "key-sim")
@@ -251,7 +251,7 @@ def test_wrapper_behaviour_is_identical_for_real_and_simulated(tmp_path):
         assert all(r.response["id"] == first_id for r in results)
 
 
-def test_conflicting_payload_never_reaches_the_provider(tmp_path):
+def test_conflicting_payload_never_reaches_the_provider(db):
     """A tampered retry must be rejected before any API call is made."""
     calls = {"n": 0}
 
@@ -259,7 +259,7 @@ def test_conflicting_payload_never_reaches_the_provider(tmp_path):
         calls["n"] += 1
         return httpx.Response(200, json=order_response())
 
-    store = IdempotencyStore(str(tmp_path / "idem.db"))
+    store = IdempotencyStore(db)
     with stub_provider(handler) as provider:
         original = {"amount_paise": 50_000, "currency": "INR", "receipt": "r"}
         tampered = {"amount_paise": 5_000_000, "currency": "INR", "receipt": "r"}
@@ -276,7 +276,7 @@ def test_conflicting_payload_never_reaches_the_provider(tmp_path):
     assert calls["n"] == 1, "the tampered retry reached Razorpay -- it must not"
 
 
-def test_a_failed_provider_call_leaves_the_key_retryable(tmp_path):
+def test_a_failed_provider_call_leaves_the_key_retryable(db):
     """An API error must not permanently burn the idempotency key."""
     state = {"fail": True, "calls": 0}
 
@@ -288,7 +288,7 @@ def test_a_failed_provider_call_leaves_the_key_retryable(tmp_path):
             )
         return httpx.Response(200, json=order_response())
 
-    store = IdempotencyStore(str(tmp_path / "idem.db"))
+    store = IdempotencyStore(db)
     p = {"amount_paise": 50_000, "currency": "INR", "receipt": "r"}
 
     with stub_provider(handler) as provider:

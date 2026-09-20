@@ -53,8 +53,8 @@ def body_for(receipt: str = "ui_abc123", event: str = "order.paid",
 
 
 @pytest.fixture
-def receiver(tmp_path):
-    audit = AuditLog(str(tmp_path / "audit.db"))
+def receiver(db):
+    audit = AuditLog(db)
     reconciled: list[str] = []
     rx = WebhookReceiver(SECRET, audit=audit, on_verified=reconciled.append)
     return rx, audit, reconciled
@@ -154,8 +154,8 @@ def test_a_missing_signature_header_is_refused(receiver):
     assert reconciled == []
 
 
-def test_an_unconfigured_receiver_refuses_everything(tmp_path):
-    audit = AuditLog(str(tmp_path / "a.db"))
+def test_an_unconfigured_receiver_refuses_everything(db):
+    audit = AuditLog(db)
     reconciled: list[str] = []
     rx = WebhookReceiver(None, audit=audit, on_verified=reconciled.append)
     body = body_for()
@@ -223,16 +223,16 @@ def test_the_payloads_own_numbers_are_never_believed(receiver):
 # -- over HTTP -------------------------------------------------------------
 
 @pytest.fixture
-def client(tmp_path):
+def client(db):
     catalog = demo_catalog()
-    audit = AuditLog(str(tmp_path / "audit.db"))
-    engine = PolicyEngine(MandateStore(str(tmp_path / "policy.db")))
+    audit = AuditLog(db)
+    engine = PolicyEngine(MandateStore(db))
     engine.mandates.issue(Mandate(
         agent_id=AGENT, max_amount_paise=50_000,
         allowed_skus=frozenset({"SKU-COFFEE"}),
         expires_at=time.time() + HOUR, velocity_limit=5,
         velocity_window_secs=HOUR))
-    store = IdempotencyStore(str(tmp_path / "idem.db"))
+    store = IdempotencyStore(db)
     gateway = PurchaseGateway(engine, store, lambda r: {"id": "order_1"}, audit=audit)
     checkout = CheckoutService(catalog, gateway, audit=audit)
     reconciled: list[str] = []
@@ -275,12 +275,12 @@ def test_an_unsigned_post_returns_401(client):
     assert reconciled == []
 
 
-def test_the_route_is_absent_when_no_receiver_is_configured(tmp_path):
+def test_the_route_is_absent_when_no_receiver_is_configured(db):
     """An app built without a receiver must not silently accept deliveries."""
     catalog = demo_catalog()
-    audit = AuditLog(str(tmp_path / "a.db"))
-    engine = PolicyEngine(MandateStore(str(tmp_path / "p.db")))
-    store = IdempotencyStore(str(tmp_path / "i.db"))
+    audit = AuditLog(db)
+    engine = PolicyEngine(MandateStore(db))
+    store = IdempotencyStore(db)
     gateway = PurchaseGateway(engine, store, lambda r: {"id": "o"}, audit=audit)
     checkout = CheckoutService(catalog, gateway, audit=audit)
 
@@ -291,7 +291,7 @@ def test_the_route_is_absent_when_no_receiver_is_configured(tmp_path):
     assert res.status_code == 501
 
 
-def test_the_demo_app_forwards_the_receiver_to_the_production_api(tmp_path):
+def test_the_demo_app_forwards_the_receiver_to_the_production_api(db):
     """The wiring, not just the receiver.
 
     `create_demo_app` mounts the production app and must pass the receiver
@@ -302,9 +302,9 @@ def test_the_demo_app_forwards_the_receiver_to_the_production_api(tmp_path):
     from zerotrust.demo import create_demo_app
 
     catalog = demo_catalog()
-    audit = AuditLog(str(tmp_path / "a.db"))
-    engine = PolicyEngine(MandateStore(str(tmp_path / "p.db")))
-    store = IdempotencyStore(str(tmp_path / "i.db"))
+    audit = AuditLog(db)
+    engine = PolicyEngine(MandateStore(db))
+    store = IdempotencyStore(db)
     gateway = PurchaseGateway(engine, store, lambda r: {"id": "o"}, audit=audit)
     checkout = CheckoutService(catalog, gateway, audit=audit)
     reconciled: list[str] = []

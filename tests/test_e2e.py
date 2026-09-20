@@ -98,15 +98,15 @@ def test_server_identity_is_stable_when_given_a_fixed_private_key():
 # -- wired into CheckoutService --------------------------------------------
 
 @pytest.fixture
-def checkout_env(tmp_path):
+def checkout_env(db):
     catalog = demo_catalog()
-    audit = AuditLog(str(tmp_path / "audit.db"))
-    engine = PolicyEngine(MandateStore(str(tmp_path / "policy.db")))
+    audit = AuditLog(db)
+    engine = PolicyEngine(MandateStore(db))
     engine.mandates.issue(Mandate(
         agent_id=AGENT, max_amount_paise=50_000,
         allowed_skus=frozenset({"SKU-COFFEE"}),
         expires_at=10_000_000_000.0, velocity_limit=5, velocity_window_secs=HOUR))
-    store = IdempotencyStore(str(tmp_path / "idem.db"))
+    store = IdempotencyStore(db)
     gateway = PurchaseGateway(
         engine, store, lambda r: {"order_id": "order_1"}, audit=audit)
     identity = ServerIdentity()
@@ -217,15 +217,15 @@ def test_a_message_sealed_to_the_wrong_key_is_refused_not_guessed(checkout_env):
 # -- the HTTP surface --------------------------------------------------------
 
 @pytest.fixture
-def api_env(tmp_path):
+def api_env(db):
     catalog = demo_catalog()
-    audit = AuditLog(str(tmp_path / "audit.db"))
-    engine = PolicyEngine(MandateStore(str(tmp_path / "policy.db")))
+    audit = AuditLog(db)
+    engine = PolicyEngine(MandateStore(db))
     engine.mandates.issue(Mandate(
         agent_id=AGENT, max_amount_paise=50_000,
         allowed_skus=frozenset({"SKU-COFFEE"}),
         expires_at=10_000_000_000.0, velocity_limit=5, velocity_window_secs=HOUR))
-    store = IdempotencyStore(str(tmp_path / "idem.db"))
+    store = IdempotencyStore(db)
     gateway = PurchaseGateway(
         engine, store, lambda r: {"order_id": "order_1"}, audit=audit)
     identity = ServerIdentity()
@@ -244,11 +244,11 @@ def test_the_public_key_endpoint_serves_a_real_x25519_key(api_env):
     assert len(base64.b64decode(body["public_key_b64"])) == 32
 
 
-def test_the_public_key_endpoint_404s_without_a_configured_identity(tmp_path):
+def test_the_public_key_endpoint_404s_without_a_configured_identity(db):
     catalog = demo_catalog()
-    audit = AuditLog(str(tmp_path / "audit.db"))
-    engine = PolicyEngine(MandateStore(str(tmp_path / "policy.db")))
-    store = IdempotencyStore(str(tmp_path / "idem.db"))
+    audit = AuditLog(db)
+    engine = PolicyEngine(MandateStore(db))
+    store = IdempotencyStore(db)
     gateway = PurchaseGateway(engine, store, lambda r: {}, audit=audit)
     checkout = CheckoutService(catalog, gateway,
                                parser=RuleBasedIntentParser(catalog), audit=audit)
@@ -297,18 +297,18 @@ def test_the_stored_audit_entry_for_a_sealed_request_is_unreadable_over_http(api
 # -- the claim is bounded, and the boundary is published -------------------
 
 @pytest.fixture
-def demo_stack(tmp_path):
+def demo_stack(db):
     """The demo app, so the Security Hub payload can be read as the UI reads it."""
     from zerotrust.demo import create_demo_app
 
     catalog = demo_catalog()
-    audit = AuditLog(str(tmp_path / "audit.db"))
-    engine = PolicyEngine(MandateStore(str(tmp_path / "policy.db")))
+    audit = AuditLog(db)
+    engine = PolicyEngine(MandateStore(db))
     engine.mandates.issue(Mandate(
         agent_id=AGENT, max_amount_paise=50_000,
         allowed_skus=frozenset({"SKU-COFFEE"}),
         expires_at=10_000_000_000.0, velocity_limit=5, velocity_window_secs=HOUR))
-    store = IdempotencyStore(str(tmp_path / "idem.db"))
+    store = IdempotencyStore(db)
     gateway = PurchaseGateway(
         engine, store, lambda r: {"order_id": "order_1"}, audit=audit)
     checkout = CheckoutService(catalog, gateway,

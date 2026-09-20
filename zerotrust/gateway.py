@@ -25,7 +25,14 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from zerotrust.audit import Actor, AuditLog, EventType
-from zerotrust.idempotency import IdempotencyStore, Outcome, Result
+from zerotrust.idempotency import (
+    CompletionNotRecorded,
+    IdempotencyStore,
+    Outcome,
+    Result,
+    scope_key,
+)
+from zerotrust.ledger import Ledger, require_shared_database
 from zerotrust.policy import Decision, PolicyEngine, PurchaseRequest
 from zerotrust.provider import ProviderTimeout
 
@@ -86,10 +93,18 @@ class PurchaseGateway:
         store: IdempotencyStore,
         execute_purchase: Callable[[PurchaseRequest], dict],
         audit: Optional[AuditLog] = None,
+        ledger: Optional[Ledger] = None,
     ) -> None:
         self.policy = policy
         self.store = store
         self.audit = audit
+        #: Optional so every caller that predates the books keeps working. When
+        #: present, each posting commits in the same transaction as the record
+        #: it mirrors -- the sale with COMPLETED, suspense with the freeze --
+        #: so the books and the idempotency store cannot disagree about a
+        #: purchase that finished. That needs one Database, checked here.
+        self.ledger = ledger
+        require_shared_database(ledger, store.db, "PurchaseGateway")
         self._execute_purchase = execute_purchase
 
     def submit(
@@ -156,13 +171,56 @@ class PurchaseGateway:
             )
             return self._execute_purchase(request)
 
+        scoped = scope_key(request.idempotency_key, request.agent_id)
+
+        def book_sale(conn, attempts: int) -> None:
+            # Runs inside the transaction that marks the key COMPLETED.
+            self.ledger.record_sale(
+                scoped, request.amount_paise, attempt=attempts,
+                agent_id=request.agent_id, request_id=request_id, conn=conn)
+
+        def book_suspense(conn, attempts: int) -> None:
+            # Suspense, not revenue: the money may or may not have moved.
+            # A no-op if a reconciler already settled this attempt.
+            self.ledger.record_unverified(
+                scoped, request.amount_paise, attempt=attempts,
+                agent_id=request.agent_id, request_id=request_id, conn=conn)
+
         try:
             result = self.store.execute(
                 request.idempotency_key,
                 request.payload(),
                 logged_action,
                 agent_id=request.agent_id,
+                also=book_sale if self.ledger is not None else None,
             )
+        except CompletionNotRecorded as exc:
+            # The provider succeeded; the COMPLETED record and its sale could
+            # not be written, and neither was. The store froze the key, so no
+            # retry can charge again, and the slot stays held: money moved.
+            # Reconciliation books the sale. Until then, suspense says so.
+            suspense = "not attempted: the record could not be frozen either"
+            if self.ledger is not None and exc.attempts is not None:
+                try:
+                    book_suspense_alone = self.ledger.record_unverified(
+                        scoped, request.amount_paise, attempt=exc.attempts,
+                        agent_id=request.agent_id, request_id=request_id)
+                    suspense = f"posted as transaction {book_suspense_alone}"
+                except Exception as posting_exc:  # noqa: BLE001
+                    suspense = f"failed: {posting_exc}"
+            self._log(
+                EventType.PAYMENT_PENDING_VERIFICATION,
+                Actor.SYSTEM,
+                mandate_id=decision.mandate_id,
+                reason=str(exc),
+                details={
+                    "error_type": type(exc.cause).__name__,
+                    "velocity_slot": "held pending reconciliation",
+                    "suspense": suspense,
+                },
+                **common,
+            )
+            raise exc.cause from exc
         except ProviderTimeout as exc:
             # The outcome is UNKNOWN, not failed. Two things follow, and both
             # are deliberate:
@@ -173,17 +231,29 @@ class PurchaseGateway:
             #  2. The velocity slot is HELD, not released. Releasing it would
             #     let an agent manufacture extra budget by inducing timeouts.
             #     Reconciliation releases it if the purchase never happened.
-            self.store.mark_pending_verification(
-                request.idempotency_key, str(exc), agent_id=request.agent_id)
+            #
+            # The freeze and the suspense posting commit together. If the
+            # posting fails the store still freezes the key on its own -- the
+            # freeze is what prevents a double charge -- and the missing
+            # posting shows in the audit entry and in `discrepancies()`.
+            details = {
+                "error_type": type(exc).__name__,
+                "velocity_slot": "held pending reconciliation",
+            }
+            try:
+                self.store.mark_pending_verification(
+                    request.idempotency_key, str(exc), agent_id=request.agent_id,
+                    also=book_suspense if self.ledger is not None else None)
+            except KeyError:
+                raise
+            except Exception as posting_exc:  # noqa: BLE001
+                details["suspense"] = f"failed: {posting_exc}"
             self._log(
                 EventType.PAYMENT_PENDING_VERIFICATION,
                 Actor.PROVIDER,
                 mandate_id=decision.mandate_id,
                 reason=str(exc),
-                details={
-                    "error_type": type(exc).__name__,
-                    "velocity_slot": "held pending reconciliation",
-                },
+                details=details,
                 **common,
             )
             raise

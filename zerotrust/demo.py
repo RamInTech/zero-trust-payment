@@ -27,13 +27,12 @@ from __future__ import annotations
 import json
 import os
 import secrets
-import sqlite3
-import tempfile
 import time
 import uuid
 from pathlib import Path
 from typing import Optional
 
+import psycopg
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -41,13 +40,21 @@ from pydantic import BaseModel
 
 from zerotrust.admin_auth import AdminAuth, AdminAuthError, AdminSession
 from zerotrust.api import create_app
-from zerotrust.audit import Actor, AuditLog, AuditWriteError, EventType
+from zerotrust.audit import (
+    APPEND_ONLY_TRIGGERS,
+    Actor,
+    AuditLog,
+    AuditWriteError,
+    EventType,
+)
 from zerotrust.catalog import Catalog, CatalogItem, ItemNotInCatalog
 from zerotrust.checkout import CheckoutService
+from zerotrust.db import Database
 from zerotrust.explain import first_detail, provider_order_id
 from zerotrust.faults import Fault, FaultInjector
 from zerotrust.gateway import PurchaseGateway
 from zerotrust.idempotency import IdempotencyStore
+from zerotrust.ledger import CLEARING, REVENUE, SALE, Ledger, UnbalancedTransaction
 from zerotrust.mandate import ANY_SKU, Mandate, MandateStore
 from zerotrust.intent import ParsedIntent
 from zerotrust.policy import PolicyEngine, PurchaseRequest
@@ -77,7 +84,28 @@ TAMPER_STATEMENTS = [
     "UPDATE audit_log SET rule = NULL WHERE rule IS NOT NULL",
     "DELETE FROM audit_log WHERE event_type = 'POLICY_DENIED'",
     "DELETE FROM audit_log",
+    # Postgres runs no row trigger for TRUNCATE, so it gets its own.
+    "TRUNCATE audit_log",
 ]
+
+
+def _attempt_tamper(conn: psycopg.Connection, sql: str) -> dict:
+    """Run one tamper statement in its own savepoint and classify the result."""
+    try:
+        with conn.transaction():
+            cursor = conn.execute(sql)
+    except psycopg.Error as exc:
+        return {"sql": sql, "outcome": "BLOCKED",
+                "error": str(exc).splitlines()[0], "rows": 0}
+    # No error AND no rows touched is not a defence -- the statement simply
+    # matched nothing, so the trigger never had to fire. Reporting that as
+    # "not blocked" would show a false breach on screen; reporting it as
+    # "blocked" would claim a defence that was never tested. It is its own
+    # outcome.
+    if cursor.rowcount in (0, -1):
+        return {"sql": sql, "outcome": "NO_ROWS_MATCHED", "error": None, "rows": 0}
+    return {"sql": sql, "outcome": "SUCCEEDED", "error": None,
+            "rows": cursor.rowcount}
 
 
 class PriceChange(BaseModel):
@@ -126,23 +154,6 @@ class ItemUpdate(BaseModel):
     #: at all is almost certainly a client mistake worth surfacing.
     name: Optional[str] = None
     price_paise: Optional[int] = None
-
-
-def _audit_triggers(db_path: str) -> list[str]:
-    """The append-only triggers, read straight from the schema.
-
-    Returned to the page verbatim so a viewer can read the mechanism rather
-    than trust an error message about it.
-    """
-    conn = sqlite3.connect(db_path)
-    try:
-        rows = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
-            "AND tbl_name = 'audit_log' ORDER BY name"
-        ).fetchall()
-    finally:
-        conn.close()
-    return [r[0] for r in rows if r[0]]
 
 
 #: The lifecycle a purchase walks, in order, each stage named by the audit
@@ -245,6 +256,7 @@ def create_demo_app(
     recommender=None,
     webhooks=None,
     admin_auth: Optional[AdminAuth] = None,
+    ledger: Optional[Ledger] = None,
 ) -> FastAPI:
     demo = FastAPI(
         title="Zero-Trust Payment Authorization — reference client",
@@ -669,16 +681,19 @@ def create_demo_app(
     def tamper_audit():
         """Try to rewrite history, and show exactly why it fails.
 
-        Runs against the LIVE audit database with a raw sqlite3 connection,
-        bypassing AuditLog entirely -- that is the point. The guarantee is a
-        property of the store, not of the code path used to reach it.
+        Runs against the LIVE audit table with a raw connection from outside
+        the application's pool, bypassing AuditLog entirely -- that is the
+        point. The guarantee is a property of the store, not of the code path
+        used to reach it. The trigger definitions are read back from Postgres's
+        catalog and shown verbatim, so a viewer reads the mechanism rather than
+        trusting an error message about it.
         """
-        triggers = _audit_triggers(audit.db_path)
+        triggers = audit.triggers()
 
         # The one real risk in this endpoint is that its safety depends on the
         # very thing it demonstrates. So verify the guarantee exists before
         # relying on it, and refuse rather than run unprotected DELETEs.
-        if len(triggers) < 2:
+        if len(triggers) < len(APPEND_ONLY_TRIGGERS):
             raise HTTPException(
                 status_code=409,
                 detail={
@@ -694,39 +709,16 @@ def create_demo_app(
 
         before = len(audit.all())
         attempts = []
-        conn = sqlite3.connect(audit.db_path)
+        conn = audit.db.outside_connection()
         try:
-            for sql in TAMPER_STATEMENTS:
-                try:
-                    cursor = conn.execute(sql)
-                    # No error AND no rows touched is not a defence -- the
-                    # statement simply matched nothing, so the trigger never
-                    # had to fire. Reporting that as "not blocked" would show
-                    # a false breach on screen; reporting it as "blocked"
-                    # would claim a defence that was never tested. It is its
-                    # own outcome.
-                    if cursor.rowcount in (0, -1):
-                        attempts.append({
-                            "sql": sql,
-                            "outcome": "NO_ROWS_MATCHED",
-                            "error": None,
-                            "rows": 0,
-                        })
-                    else:
-                        attempts.append({
-                            "sql": sql,
-                            "outcome": "SUCCEEDED",
-                            "error": None,
-                            "rows": cursor.rowcount,
-                        })
-                except sqlite3.Error as exc:
-                    attempts.append({
-                        "sql": sql,
-                        "outcome": "BLOCKED",
-                        "error": str(exc),
-                        "rows": 0,
-                    })
-            conn.rollback()
+            # One outer transaction, always rolled back, with each statement
+            # in its own savepoint: a refused statement aborts only its
+            # savepoint, so the next one is genuinely attempted rather than
+            # failing as "transaction aborted" -- and if one ever did get
+            # through, the rollback undoes it.
+            with conn.transaction(force_rollback=True):
+                for sql in TAMPER_STATEMENTS:
+                    attempts.append(_attempt_tamper(conn, sql))
         finally:
             conn.close()
         after = len(audit.all())
@@ -768,9 +760,8 @@ def create_demo_app(
         reporting a real, permanent BROKEN chain afterward, which would be a
         worse kind of dishonesty than not having this button at all.
         """
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            db_path = os.path.join(tmp_dir, "chain_demo.db")
-            demo_log = AuditLog(db_path)
+        with Database.temporary(audit.db.dsn, prefix="demo_chain") as scratch:
+            demo_log = AuditLog(scratch)
 
             rid = f"demo_chain_{secrets.token_hex(4)}"
             demo_log.record(EventType.PURCHASE_REQUESTED, Actor.AGENT,
@@ -782,17 +773,13 @@ def create_demo_app(
 
             before = demo_log.verify().as_dict()
 
-            conn = sqlite3.connect(db_path)
-            try:
-                conn.execute("DROP TRIGGER IF EXISTS audit_log_no_update")
+            with scratch.outside_connection() as conn:
+                conn.execute("DROP TRIGGER IF EXISTS audit_log_no_update ON audit_log")
                 conn.execute(
                     "UPDATE audit_log SET reason = 'nothing to see here' "
-                    "WHERE event_type = 'POLICY_APPROVED' AND request_id = ?",
+                    "WHERE event_type = 'POLICY_APPROVED' AND request_id = %s",
                     (rid,),
                 )
-                conn.commit()
-            finally:
-                conn.close()
 
             after = demo_log.verify().as_dict()
 
@@ -820,13 +807,13 @@ def create_demo_app(
         proves this in-process; this is the same proof, exposed live.
 
         Runs against a fully throwaway stack -- its own catalog-less mandate,
-        policy engine, and idempotency store, all in temp SQLite files, torn
-        down when the request ends -- because there is no way to make the
-        REAL audit log briefly unwritable without it actually failing to log
-        real requests while it's broken.
+        policy engine, and idempotency store, all in a scratch schema dropped
+        when the request ends -- because there is no way to make the REAL
+        audit log briefly unwritable without it actually failing to log real
+        requests while it's broken.
         """
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            mandate_store = MandateStore(os.path.join(tmp_dir, "mandate.db"))
+        with Database.temporary(audit.db.dsn, prefix="demo_block") as scratch:
+            mandate_store = MandateStore(scratch)
             demo_agent = f"demo_write_block_{secrets.token_hex(4)}"
             now = time.time()
             mandate_store.issue(Mandate(
@@ -836,8 +823,8 @@ def create_demo_app(
                 expires_at=now + 3600,
                 velocity_limit=100,
             ))
-            policy = PolicyEngine(mandate_store, db_path=os.path.join(tmp_dir, "policy.db"))
-            store = IdempotencyStore(os.path.join(tmp_dir, "idempotency.db"))
+            policy = PolicyEngine(mandate_store)
+            store = IdempotencyStore(scratch)
 
             provider_calls: list = []
 
@@ -848,7 +835,7 @@ def create_demo_app(
                     raise AuditWriteError(
                         "simulated disk failure: the audit log cannot be written")
 
-            broken_audit = UnwritableAuditLog(os.path.join(tmp_dir, "audit.db"))
+            broken_audit = UnwritableAuditLog(scratch)
             gateway = PurchaseGateway(
                 policy, store,
                 execute_purchase=lambda r: provider_calls.append(r) or {"order_id": "demo"},
@@ -876,6 +863,109 @@ def create_demo_app(
             "raised": raised,
             "blocked": raised is not None,
             "provider_calls": len(provider_calls),
+        }
+
+    @demo.get("/demo/ledger")
+    def ledger_view(limit: int = 20):
+        """The books: every balance summed from history, and whether they add up."""
+        if ledger is None:
+            raise HTTPException(
+                status_code=501,
+                detail={"reason": "no ledger is configured on this server"})
+        tb = ledger.trial_balance()
+        return {
+            "trial_balance": tb,
+            "revenue_paise": -tb[REVENUE],
+            "exposure_paise": ledger.exposure(),
+            "verify": ledger.verify().as_dict(),
+            "discrepancies": ledger.discrepancies(checkout.gateway.store.records()),
+            "purchases_before_the_books": ledger.predates(
+                checkout.gateway.store.records()),
+            "started_at": ledger.started_at,
+            "recent": ledger.recent(limit),
+        }
+
+    @demo.post("/demo/ledger/imbalance")
+    def ledger_imbalance_demo():
+        """Try to make the books not add up, three ways, and show each outcome.
+
+        1. Through the ledger's own API: an unbalanced posting is refused and
+           nothing is written.
+        2. Raw SQL appending a line to an existing, balanced posting: the
+           database refuses it (a posting takes exactly the lines it declared).
+        3. Raw SQL writing a brand-new unbalanced posting: Postgres refuses the
+           whole transaction at COMMIT, where a deferred trigger re-adds it.
+           (Under SQLite nothing refused this; it was only caught afterwards.)
+        4. The same forgery after dropping that trigger -- what someone with
+           DDL rights could do: it is written, and `verify()` names it.
+
+        Runs on a throwaway schema, never this session's books, for the same
+        reason as the chain-break demo: a genuinely unbalanced real ledger
+        would stay unbalanced for the rest of the run.
+        """
+        with Database.temporary(ledger.db.dsn if ledger is not None
+                                else audit.db.dsn, prefix="demo_books") as scratch:
+            books = Ledger(scratch)
+            sale = books.record_sale("demo:purchase-1", 15_000, attempt=1)
+            before = books.verify().as_dict()
+
+            try:
+                books.post(SALE, "demo:forged",
+                           [(CLEARING, 15_000), (REVENUE, -14_000)])
+                refused = None
+            except UnbalancedTransaction as exc:
+                refused = str(exc)
+            after_refusal = books.verify().as_dict()
+
+            def forge(conn, memo: str) -> int:
+                """One posting whose lines are each valid and net +100."""
+                with conn.transaction():
+                    txn = conn.execute(
+                        "INSERT INTO ledger_transactions (kind, scope_key, "
+                        "attempt, line_count, posted_at, memo) VALUES "
+                        "('SALE', 'demo:forged-raw', 1, 2, 0, %s) "
+                        "RETURNING txn_id", (memo,)).fetchone()["txn_id"]
+                    for account, amount in ((CLEARING, 500), (REVENUE, -400)):
+                        conn.execute(
+                            "INSERT INTO ledger_entries (txn_id, account, "
+                            "amount_paise) VALUES (%s, %s, %s)",
+                            (txn, account, amount))
+                return txn
+
+            with scratch.outside_connection() as conn:
+                try:
+                    conn.execute(
+                        "INSERT INTO ledger_entries (txn_id, account, amount_paise) "
+                        "VALUES (%s, %s, 999)", (sale, CLEARING))
+                    append_blocked = None
+                except psycopg.Error as exc:
+                    append_blocked = str(exc).splitlines()[0]
+
+                try:
+                    forge(conn, "written with raw SQL")
+                    raw_sql_refused = None
+                except psycopg.Error as exc:
+                    raw_sql_refused = str(exc).splitlines()[0]
+                after_raw_sql = books.verify().as_dict()
+
+                conn.execute("DROP TRIGGER ledger_entries_balanced ON ledger_entries")
+                conn.execute("DROP TRIGGER ledger_transactions_balanced "
+                             "ON ledger_transactions")
+                forged = forge(conn, "written with the commit-time check dropped")
+            after_check_removed = books.verify().as_dict()
+
+        return {
+            "synthetic": True,
+            "note": ("Ran against a throwaway schema, never this session's real "
+                     "books, so the forged posting disappears with it."),
+            "before": before,
+            "refused": refused,
+            "after_refusal": after_refusal,
+            "append_blocked": append_blocked,
+            "raw_sql_refused": raw_sql_refused,
+            "after_raw_sql": after_raw_sql,
+            "forged_txn_id": forged,
+            "after_check_removed": after_check_removed,
         }
 
     @demo.post("/demo/agent")
@@ -1065,7 +1155,7 @@ def create_demo_app(
         NOT implemented in this system, and are reported as such rather than
         being rendered as though they were.
         """
-        triggers = _audit_triggers(audit.db_path)
+        triggers = audit.triggers()
         chain = audit.verify()
         parsed_fields = sorted(ParsedIntent.__dataclass_fields__)
         # Named from the parser actually in use, not from an env var: an
@@ -1084,6 +1174,40 @@ def create_demo_app(
             if e.event_type == EventType.INTENT_PARSED
             and "raw_text" in e.details
         )
+        # Only when books are actually kept. A card claiming the books balance
+        # on a server with no ledger would be an indicator for a protection
+        # that does not exist.
+        ledger_cards = []
+        if ledger is not None:
+            books = ledger.verify()
+            ledger_cards.append({
+                "id": "double_entry_ledger",
+                "title": "The books always balance",
+                "mechanism": (
+                    "Every posting's debit and credit lines must sum to zero: "
+                    "checked in Python, then by a deferred Postgres trigger "
+                    "that refuses the whole transaction at COMMIT; balances "
+                    "are summed from history, never stored; one sale per "
+                    "idempotency key, enforced by a unique index; a sale "
+                    "commits in the same transaction as the purchase record "
+                    "it mirrors"
+                ),
+                "boundary": (
+                    "A crash after the provider charged leaves revenue unbooked "
+                    "until that purchase is reconciled. Someone with DDL rights "
+                    "can drop the commit-time trigger and then write an "
+                    "unbalanced posting: nothing refuses it at that point, and "
+                    "verify() names it when the books are re-added."
+                ),
+                "evidence": {
+                    "books": books.summary,
+                    "revenue_paise": -ledger.trial_balance()[REVENUE],
+                    "unverified_exposure_paise": ledger.exposure(),
+                    "discrepancies": len(ledger.discrepancies(
+                        checkout.gateway.store.records())),
+                },
+            })
+
         return {
             "implemented": [
                 {
@@ -1126,7 +1250,7 @@ def create_demo_app(
                     "id": "append_only_audit",
                     "title": "Append-only, hash-chained audit log",
                     "mechanism": (
-                        "BEFORE UPDATE / BEFORE DELETE triggers RAISE(ABORT); "
+                        "BEFORE UPDATE / DELETE / TRUNCATE triggers raise restrict_violation; "
                         "each entry carries the SHA-256 of its contents linked "
                         "to its predecessor"
                     ),
@@ -1188,6 +1312,7 @@ def create_demo_app(
                             EventType.PAYMENT_PENDING_VERIFICATION),
                     },
                 },
+                *ledger_cards,
                 {
                     "id": "webhook_verification",
                     "title": "Webhooks are verified, and cannot authorise",

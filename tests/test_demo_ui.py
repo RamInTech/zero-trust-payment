@@ -9,7 +9,6 @@ into a surface the adversarial suite does not attack.
 
 from __future__ import annotations
 
-import sqlite3
 import time
 
 import bcrypt
@@ -18,7 +17,7 @@ from fastapi.testclient import TestClient
 
 from zerotrust.admin_auth import AdminAuth
 from zerotrust.api import create_app
-from zerotrust.audit import AuditLog
+from zerotrust.audit import APPEND_ONLY_TRIGGERS, AuditLog
 from zerotrust.catalog import demo_catalog
 from zerotrust.checkout import CheckoutService
 from zerotrust.config import AdminConfig
@@ -28,6 +27,7 @@ from zerotrust.faults import Fault, FaultInjector
 from zerotrust.gateway import PurchaseGateway
 from zerotrust.idempotency import IdempotencyStore
 from zerotrust.intent import RuleBasedIntentParser
+from zerotrust.ledger import Ledger
 from zerotrust.mandate import ANY_SKU, Mandate, MandateStore
 from zerotrust.policy import PolicyEngine
 from zerotrust.provider import ProviderTimeout
@@ -80,16 +80,16 @@ PRODUCTION_ROUTES = {
 
 
 @pytest.fixture
-def stack(tmp_path):
+def stack(db):
     catalog = demo_catalog()
-    audit = AuditLog(str(tmp_path / "audit.db"))
-    engine = PolicyEngine(MandateStore(str(tmp_path / "policy.db")))
+    audit = AuditLog(db)
+    engine = PolicyEngine(MandateStore(db))
     engine.mandates.issue(Mandate(
         agent_id=AGENT, max_amount_paise=50_000,
         allowed_skus=frozenset({"SKU-COFFEE", "SKU-CAKE", "SKU-TEA"}),
         expires_at=time.time() + 24 * HOUR, velocity_limit=3,
         velocity_window_secs=HOUR))
-    store = IdempotencyStore(str(tmp_path / "idem.db"))
+    store = IdempotencyStore(db)
     calls = []
     faults = FaultInjector()
 
@@ -99,7 +99,8 @@ def stack(tmp_path):
         calls.append(request)
         return {"order_id": f"order_{len(calls)}", "amount": request.amount_paise}
 
-    gateway = PurchaseGateway(engine, store, execute, audit=audit)
+    ledger = Ledger(db)
+    gateway = PurchaseGateway(engine, store, execute, audit=audit, ledger=ledger)
     checkout = CheckoutService(catalog, gateway,
                                parser=RuleBasedIntentParser(catalog), audit=audit,
                                server_identity=ServerIdentity())
@@ -107,7 +108,7 @@ def stack(tmp_path):
         username=ADMIN_USERNAME, password_hash=ADMIN_PASSWORD_HASH,
         session_secret="test-session-secret-not-a-real-secret"))
     app = create_demo_app(checkout, engine, audit, catalog, agent_id=AGENT,
-                          faults=faults, admin_auth=admin_auth)
+                          faults=faults, admin_auth=admin_auth, ledger=ledger)
     admin_token = admin_auth.login(ADMIN_USERNAME, ADMIN_PASSWORD)
     client = TestClient(app)
     # Signed in by default: the vast majority of tests through this fixture
@@ -117,7 +118,8 @@ def stack(tmp_path):
     client.headers["Authorization"] = f"Bearer {admin_token}"
     return {"client": client, "app": app, "calls": calls, "catalog": catalog,
             "audit": audit, "engine": engine, "checkout": checkout,
-            "faults": faults, "admin_auth": admin_auth, "admin_token": admin_token}
+            "faults": faults, "admin_auth": admin_auth, "admin_token": admin_token,
+            "ledger": ledger}
 
 
 @pytest.fixture
@@ -295,10 +297,11 @@ def test_tampering_is_refused_and_the_log_is_unchanged(stack):
 def test_the_trigger_definitions_are_shown_not_just_the_error(stack):
     """A viewer should be able to read the mechanism, not trust a message."""
     triggers = stack["client"].post("/demo/tamper-audit").json()["triggers"]
-    assert len(triggers) == 2
-    assert all("RAISE(ABORT" in t for t in triggers)
+    assert len(triggers) == len(APPEND_ONLY_TRIGGERS)
+    assert all("audit_log_refuse_change()" in t for t in triggers)
     assert any("BEFORE UPDATE" in t for t in triggers)
     assert any("BEFORE DELETE" in t for t in triggers)
+    assert any("BEFORE TRUNCATE" in t for t in triggers)
 
 
 def test_a_statement_matching_no_rows_is_not_counted_as_a_defence(stack):
@@ -316,14 +319,13 @@ def test_a_statement_matching_no_rows_is_not_counted_as_a_defence(stack):
     assert body["tested"] == len([o for o in outcomes if o != "NO_ROWS_MATCHED"])
 
 
-def test_the_demo_refuses_to_run_without_the_guarantee(stack, tmp_path):
-    """Its own safety depends on the thing it demonstrates, so it checks first."""
-    unprotected = AuditLog(str(tmp_path / "unprotected.db"))
-    conn = sqlite3.connect(unprotected.db_path)
-    conn.execute("DROP TRIGGER audit_log_no_update")
-    conn.execute("DROP TRIGGER audit_log_no_delete")
-    conn.commit()
-    conn.close()
+@pytest.mark.parametrize("dropped", APPEND_ONLY_TRIGGERS)
+def test_the_demo_refuses_to_run_without_the_guarantee(stack, db_factory, dropped):
+    """Its own safety depends on the thing it demonstrates, so it checks first
+    -- and any one missing trigger, TRUNCATE's included, is enough to refuse."""
+    unprotected = AuditLog(db_factory())
+    with unprotected.db.outside_connection() as conn:
+        conn.execute(f"DROP TRIGGER {dropped} ON audit_log")
 
     app = create_demo_app(stack["checkout"], stack["engine"], unprotected,
                           stack["catalog"], agent_id=AGENT)
@@ -408,6 +410,89 @@ def test_the_audit_before_payment_card_is_in_the_security_layers(stack):
     assert card["evidence"]["payment_captured"] >= 0
 
 
+# -- the books ---------------------------------------------------------------
+
+def confirm(client, pending):
+    return client.post(f"/api/intents/{pending['request_id']}/confirm", json={})
+
+
+def test_a_purchase_through_the_demo_app_is_booked(stack):
+    client = stack["client"]
+    confirm(client, display(client))
+
+    books = client.get("/demo/ledger").json()
+    assert books["revenue_paise"] == 15_000
+    assert books["exposure_paise"] == 0
+    assert books["verify"]["balanced"] is True
+    assert books["discrepancies"] == []
+    assert books["purchases_before_the_books"] == 0
+    assert books["recent"][0]["kind"] == "SALE"
+
+
+def test_a_timeout_shows_as_exposure_not_revenue(stack):
+    client = stack["client"]
+    pending = display(client)
+    stack["faults"].arm(Fault.PROVIDER_TIMEOUT)
+    confirm(client, pending)
+
+    books = client.get("/demo/ledger").json()
+    assert books["exposure_paise"] == 15_000
+    assert books["revenue_paise"] == 0
+    assert books["verify"]["balanced"] is True
+
+
+def test_a_server_without_a_ledger_does_not_claim_one(stack):
+    app = create_demo_app(stack["checkout"], stack["engine"], stack["audit"],
+                          stack["catalog"], agent_id=AGENT)
+    client = TestClient(app)
+    assert client.get("/demo/ledger").status_code == 501
+    ids = {l["id"] for l in client.get("/demo/security/layers").json()["implemented"]}
+    assert "double_entry_ledger" not in ids
+
+
+def test_the_imbalance_demo_is_refused_blocked_refused_then_caught(stack):
+    body = stack["client"].post("/demo/ledger/imbalance").json()
+
+    assert body["synthetic"] is True
+    assert body["before"]["balanced"] is True
+    assert "sum to" in body["refused"]
+    assert body["after_refusal"]["balanced"] is True
+    assert "closed" in body["append_blocked"]
+    # Phase 10: the raw forgery is refused at COMMIT, not merely detected.
+    assert "unbalanced" in body["raw_sql_refused"]
+    assert body["after_raw_sql"]["balanced"] is True
+    assert body["after_raw_sql"]["transactions"] == 1
+    # Only with the commit-time check dropped does it land -- and it is named.
+    assert body["after_check_removed"]["balanced"] is False
+    assert str(body["forged_txn_id"]) in body["after_check_removed"]["summary"]
+
+
+def test_the_imbalance_demo_never_touches_the_real_books(stack):
+    client = stack["client"]
+    confirm(client, display(client))
+    before = client.get("/demo/ledger").json()["verify"]
+
+    client.post("/demo/ledger/imbalance")
+
+    after = client.get("/demo/ledger").json()["verify"]
+    assert after == before
+    assert after["balanced"] is True
+
+
+def test_the_ledger_card_reports_the_live_books(stack):
+    layers = stack["client"].get("/demo/security/layers").json()
+    card = next(l for l in layers["implemented"] if l["id"] == "double_entry_ledger")
+    assert set(card["evidence"]) == {
+        "books", "revenue_paise", "unverified_exposure_paise", "discrepancies"}
+    assert card["evidence"]["books"] == "no postings yet"
+    # Phase 10 removed the non-atomic caveat; the card must not still claim it,
+    # and must name what remains -- a check that DDL rights can remove.
+    assert "same transaction" in card["mechanism"]
+    assert "COMMIT" in card["mechanism"]
+    assert "atomic" not in card["boundary"]
+    assert "DDL" in card["boundary"]
+
+
 def test_the_idempotency_key_is_visible_on_the_demo_view_only(stack):
     """The key is shown for transparency, without touching the API's response."""
     client = stack["client"]
@@ -482,7 +567,8 @@ def test_security_layers_report_only_real_mechanisms(stack):
     ids = {layer["id"] for layer in body["implemented"]}
     assert ids == {
         "exactly_once", "mandate", "confirmation", "append_only_audit",
-        "audit_before_payment", "webhook_verification", "admin_auth",
+        "audit_before_payment", "double_entry_ledger",
+        "webhook_verification", "admin_auth",
         "price_revalidation", "unknown_outcomes", "llm_no_authority",
         "e2e_chat_encryption", "instant_revocation",
     }
@@ -516,7 +602,7 @@ def test_the_audit_layer_reports_whether_the_guarantee_is_present(stack):
     layer = next(l for l in body["implemented"] if l["id"] == "append_only_audit")
 
     assert layer["evidence"]["guarantee_present"] is True
-    assert len(layer["evidence"]["triggers"]) == 2
+    assert len(layer["evidence"]["triggers"]) == len(APPEND_ONLY_TRIGGERS)
 
 
 def test_the_admin_auth_layer_reports_that_it_is_configured(stack):

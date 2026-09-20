@@ -47,13 +47,13 @@ def catalog():
 
 
 @pytest.fixture
-def audit(tmp_path, clock):
-    return AuditLog(str(tmp_path / "audit.db"), clock=clock)
+def audit(db, clock):
+    return AuditLog(db, clock=clock)
 
 
 @pytest.fixture
-def engine(tmp_path, clock):
-    return PolicyEngine(MandateStore(str(tmp_path / "policy.db"), clock=clock),
+def engine(db, clock):
+    return PolicyEngine(MandateStore(db, clock=clock),
                         clock=clock)
 
 
@@ -71,9 +71,9 @@ def mandate(engine, clock):
 
 
 @pytest.fixture
-def checkout(engine, catalog, audit, tmp_path, clock):
+def checkout(engine, catalog, audit, db, clock):
     calls = []
-    store = IdempotencyStore(str(tmp_path / "idem.db"), clock=clock)
+    store = IdempotencyStore(db, clock=clock)
 
     def execute(request):
         calls.append(request)
@@ -329,10 +329,10 @@ def test_adversarial_prompts_cannot_skip_confirmation(checkout, audit, mandate,
 
 
 def test_a_compromised_parser_still_cannot_authorise(engine, catalog, audit,
-                                                     tmp_path, clock, mandate):
+                                                     db, clock, mandate):
     """The parser cooperates with the attacker; the mandate still refuses."""
     calls = []
-    store = IdempotencyStore(str(tmp_path / "idem.db"), clock=clock)
+    store = IdempotencyStore(db, clock=clock)
     gateway = PurchaseGateway(
         engine, store,
         lambda r: (calls.append(r), {"order_id": "x"})[1], audit=audit)
@@ -526,12 +526,12 @@ def test_repeated_confirms_do_not_duplicate_the_intent_entry(checkout, audit,
 
 
 def test_gateway_still_logs_the_intent_when_called_directly(engine, audit,
-                                                            tmp_path, clock,
+                                                            db_factory, clock,
                                                             mandate):
     """The gateway is still a complete door on its own."""
     from zerotrust.policy import PurchaseRequest as PR
 
-    store = IdempotencyStore(str(tmp_path / "idem2.db"), clock=clock)
+    store = IdempotencyStore(db_factory(), clock=clock)
     gw = PurchaseGateway(engine, store, lambda r: {"order_id": "x"}, audit=audit)
     outcome = gw.submit(PR(AGENT, "SKU-COFFEE", 10_000, "direct-key"))
 

@@ -36,11 +36,11 @@ class FakeClock:
 
 
 @pytest.fixture
-def env(tmp_path):
+def env(db):
     clock = FakeClock()
     catalog = demo_catalog()
-    audit = AuditLog(str(tmp_path / "audit.db"), clock=clock)
-    engine = PolicyEngine(MandateStore(str(tmp_path / "policy.db"), clock=clock),
+    audit = AuditLog(db, clock=clock)
+    engine = PolicyEngine(MandateStore(db, clock=clock),
                           clock=clock)
     engine.mandates.issue(Mandate(
         agent_id=AGENT, max_amount_paise=50_000,
@@ -50,7 +50,7 @@ def env(tmp_path):
 
     calls = []
     gateway = PurchaseGateway(
-        engine, IdempotencyStore(str(tmp_path / "idem.db"), clock=clock),
+        engine, IdempotencyStore(db, clock=clock),
         lambda r: (calls.append(r), {"order_id": f"order_{len(calls)}"})[1],
         audit=audit)
     checkout = CheckoutService(catalog, gateway,
