@@ -61,6 +61,12 @@ def db(db_factory) -> Database:
     return db_factory()
 
 
+@pytest.fixture
+def test_dsn() -> str:
+    """The DSN itself, for tests that hand it to a subprocess or a harness."""
+    return TEST_DSN
+
+
 @pytest.fixture(scope="module")
 def module_db():
     """One schema shared by a whole module, for expensive stateful runs."""

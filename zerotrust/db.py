@@ -57,7 +57,13 @@ class Database:
         self._owns_schema = owns_schema
         with psycopg.connect(dsn, autocommit=True) as conn:
             conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
-        self._conninfo = make_conninfo(dsn, options=f"-c search_path={schema}")
+        # application_name tags every backend this pool opens, so a tool can
+        # find them in pg_stat_activity -- which is how Phase 11's chaos
+        # harness terminates connections mid-transaction without touching
+        # anyone else's.
+        self._conninfo = make_conninfo(
+            dsn, options=f"-c search_path={schema}",
+            application_name=f"zerotrust-{schema}")
         self._pool = ConnectionPool(
             self._conninfo, min_size=1, max_size=max_connections,
             kwargs={"autocommit": True, "row_factory": dict_row},
