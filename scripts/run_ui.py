@@ -179,7 +179,13 @@ def build(force_simulated: bool = False):
             return offline_provider.create_order(
                 request.amount_paise, receipt=_receipt(request))
 
-    gateway = PurchaseGateway(engine, store, execute, audit=audit, ledger=ledger)
+    # find_orders: before a stale key is re-run, ask the provider whether the
+    # stalled attempt already charged. Without it, a server that died mid-
+    # payment could have its purchase charged again on the next retry.
+    order_source = provider if live else offline_provider
+    gateway = PurchaseGateway(
+        engine, store, execute, audit=audit, ledger=ledger,
+        find_orders=lambda request: order_source.orders_for_receipt(_receipt(request)))
 
     # The agent is a real LLM when one is configured. The fallback is not a
     # nicety: a rate limit or a dropped connection would otherwise take the
