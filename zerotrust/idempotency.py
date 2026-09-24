@@ -53,6 +53,11 @@ class Outcome(str, Enum):
     #: resolves it -- retrying here is exactly how a timeout becomes a double
     #: charge, so this state deliberately refuses to proceed.
     AWAITING_VERIFICATION = "AWAITING_VERIFICATION"
+    #: A stale claimant turned out to have charged before it died. Its key is
+    #: completed from the provider's own record of that charge, and the action
+    #: is NOT run again. Before Phase 12, this case re-ran the action -- and
+    #: charged the customer a second time.
+    RECOVERED = "RECOVERED"
 
 
 #: Outcomes for which the underlying action was actually invoked.
@@ -66,10 +71,48 @@ class Result:
     response: Optional[dict] = None
     reason: Optional[str] = None
     attempts: int = 1
+    #: When this caller's claim was taken. A later write checks it is still
+    #: the value on the row, so a claim lost to another caller cannot act.
+    claimed_at: Optional[float] = None
+    #: For a reclaim: when the stalled claimant took the key. How long ago
+    #: that was decides whether "the provider has no order" means anything yet.
+    prior_claimed_at: Optional[float] = None
 
     @property
     def executed(self) -> bool:
         return self.outcome in EXECUTING_OUTCOMES
+
+
+class StaleCheck(str, Enum):
+    """What the provider says about a stalled claimant's attempt."""
+
+    EXECUTED = "EXECUTED"          # it charged; complete from that order
+    NOT_EXECUTED = "NOT_EXECUTED"  # it did not; safe to run the action
+    UNKNOWN = "UNKNOWN"            # cannot tell; freeze, do not guess
+
+
+@dataclass(frozen=True)
+class StaleVerdict:
+    check: StaleCheck
+    response: Optional[dict] = None
+    reason: Optional[str] = None
+
+    @classmethod
+    def executed(cls, response: dict) -> "StaleVerdict":
+        return cls(StaleCheck.EXECUTED, response=response)
+
+    @classmethod
+    def not_executed(cls) -> "StaleVerdict":
+        return cls(StaleCheck.NOT_EXECUTED)
+
+    @classmethod
+    def unknown(cls, reason: str) -> "StaleVerdict":
+        return cls(StaleCheck.UNKNOWN, reason=reason)
+
+
+#: Asked, outside any lock, before a reclaimed key's action runs. The store
+#: knows nothing about providers; the caller that does supplies this.
+VerifyStale = Callable[[Result], StaleVerdict]
 
 
 def scope_key(key: str, agent_id: Optional[str] = None) -> str:
@@ -221,7 +264,8 @@ class IdempotencyStore:
                 )
                 if cur.rowcount == 1:
                     return Result(
-                        Outcome.RECLAIMED, key, attempts=row["attempts"] + 1
+                        Outcome.RECLAIMED, key, attempts=row["attempts"] + 1,
+                        claimed_at=now, prior_claimed_at=row["claimed_at"],
                     )
                 return Result(
                     Outcome.IN_PROGRESS,
@@ -376,8 +420,21 @@ class IdempotencyStore:
         agent_id: Optional[str] = None,
         *,
         also: Optional[Also] = None,
+        verify_stale: Optional[VerifyStale] = None,
+        also_on_freeze: Optional[Also] = None,
     ) -> Result:
         """Run `action` at most once for this key.
+
+        `verify_stale(claim)` is asked before a RECLAIMED key's action runs.
+        A stale claim means the previous claimant stopped answering, not that
+        it failed -- it may have charged and died before recording it. So:
+        EXECUTED completes the key from the provider's order without running
+        the action (outcome RECOVERED); UNKNOWN freezes the key for
+        reconciliation, running `also_on_freeze` in the same transaction
+        (outcome AWAITING_VERIFICATION); NOT_EXECUTED runs the action, but only
+        after confirming this caller still holds the claim. Without a
+        verifier, a reclaim runs the action unconditionally, as before
+        Phase 12 -- which is safe only if the stalled claimant never charged.
 
         `also(conn, attempts)` runs inside the transaction that marks the key
         COMPLETED -- the gateway books the sale there -- so the record and the
@@ -408,12 +465,23 @@ class IdempotencyStore:
                 attempts=claim.attempts,
             )
 
+        if claim.outcome is Outcome.RECLAIMED and verify_stale is not None:
+            settled = self._settle_stale_claim(scoped, key, claim, verify_stale,
+                                               also, also_on_freeze)
+            if settled is not None:
+                return settled
+
         try:
             response = action()
         except Exception:
             self._abandon(scoped)
             raise
 
+        self._complete(scoped, response, also)
+        return Result(claim.outcome, key, response=response, attempts=claim.attempts)
+
+    def _complete(self, scoped: str, response: Any, also: Optional[Also]) -> None:
+        """Mark COMPLETED with `also`, freezing the key if that write fails."""
         try:
             self._finish(scoped, response, also)
         except Exception as exc:
@@ -429,4 +497,95 @@ class IdempotencyStore:
             except Exception:  # noqa: BLE001 -- the database itself is gone
                 attempts = None
             raise CompletionNotRecorded(exc, response, attempts) from exc
-        return Result(claim.outcome, key, response=response, attempts=claim.attempts)
+
+    # -- a reclaim that asks first (Phase 12) -----------------------------
+
+    def _settle_stale_claim(
+        self, scoped: str, key: str, claim: Result, verify_stale: VerifyStale,
+        also: Optional[Also], also_on_freeze: Optional[Also],
+    ) -> Optional[Result]:
+        """Decide a reclaimed key from what the provider says, not from hope.
+
+        Returns a finished Result, or None to mean "verified not executed, and
+        this caller still holds the claim: run the action".
+
+        The provider is asked with no row lock held. This caller holds the key
+        by its fresh `claimed_at` instead -- anyone else now sees IN_PROGRESS
+        -- and every write below is fenced on that value, so if the check
+        outlives the staleness window and someone else takes the key, this
+        caller stands down rather than acting on a claim it no longer holds.
+        """
+        try:
+            verdict = verify_stale(claim)
+        except Exception as exc:  # noqa: BLE001 -- a failed check is not a "no"
+            verdict = StaleVerdict.unknown(
+                f"checking whether the stalled attempt charged failed: {exc}")
+
+        if verdict.check is StaleCheck.EXECUTED:
+            # The stalled claimant's charge is real. Record it; do not repeat it.
+            self._complete(scoped, verdict.response, also)
+            return Result(
+                Outcome.RECOVERED, key, response=verdict.response,
+                reason=("the stalled attempt had already charged; completed "
+                        "from the provider's order without charging again"),
+                attempts=claim.attempts)
+
+        if verdict.check is StaleCheck.UNKNOWN:
+            reason = verdict.reason or "the stalled attempt's outcome is unknown"
+            attempts = self._freeze_held_claim(scoped, claim.claimed_at, reason,
+                                               also_on_freeze)
+            if attempts is None:
+                return self._lost_claim(key, claim)
+            return Result(Outcome.AWAITING_VERIFICATION, key, reason=reason,
+                          attempts=attempts)
+
+        # NOT_EXECUTED. Re-take the claim before acting: the check may have
+        # outlived the staleness window, and a claim that has changed hands is
+        # not this caller's to act on.
+        if not self._renew_claim(scoped, claim.claimed_at):
+            return self._lost_claim(key, claim)
+        return None
+
+    @staticmethod
+    def _lost_claim(key: str, claim: Result) -> Result:
+        return Result(
+            Outcome.IN_PROGRESS, key,
+            reason=("another caller took this key while the stalled attempt "
+                    "was being verified"),
+            attempts=claim.attempts)
+
+    def _renew_claim(self, scoped: str, claimed_at: float) -> bool:
+        with self.db.connection() as conn:
+            cur = conn.execute(
+                "UPDATE idempotency_records SET claimed_at = %s "
+                "WHERE key = %s AND claimed_at = %s AND status = %s",
+                (self._clock(), scoped, claimed_at, PROCESSING))
+        return cur.rowcount == 1
+
+    def _freeze_held_claim(self, scoped: str, claimed_at: float, reason: str,
+                           also: Optional[Also]) -> Optional[int]:
+        """Freeze the key if this caller still holds it. None if it does not.
+
+        `also` (a suspense posting) commits with the freeze; if it fails, the
+        key is frozen without it -- the freeze is what stops a second charge.
+        """
+        def freeze(with_also: Optional[Also]) -> Optional[int]:
+            with self.db.transaction() as conn:
+                row = conn.execute(
+                    "UPDATE idempotency_records SET status = %s, response = %s "
+                    "WHERE key = %s AND claimed_at = %s AND status = %s "
+                    "RETURNING attempts",
+                    (PENDING_VERIFICATION, json.dumps({"pending_reason": reason}),
+                     scoped, claimed_at, PROCESSING)).fetchone()
+                if row is None:
+                    return None
+                if with_also is not None:
+                    with_also(conn, row["attempts"])
+                return row["attempts"]
+
+        if also is None:
+            return freeze(None)
+        try:
+            return freeze(also)
+        except Exception:  # noqa: BLE001
+            return freeze(None)

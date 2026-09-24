@@ -86,6 +86,9 @@ class EventType(str, Enum):
     IDEMPOTENCY_CONFLICT = "IDEMPOTENCY_CONFLICT"
     IDEMPOTENCY_IN_PROGRESS = "IDEMPOTENCY_IN_PROGRESS"
     IDEMPOTENCY_RECLAIMED = "IDEMPOTENCY_RECLAIMED"
+    #: Phase 12: a stale key whose stalled attempt had already charged,
+    #: completed from the provider's order instead of charged again.
+    IDEMPOTENCY_RECOVERED = "IDEMPOTENCY_RECOVERED"
 
     # Money (Phase 2)
     PAYMENT_ATTEMPTED = "PAYMENT_ATTEMPTED"

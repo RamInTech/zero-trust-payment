@@ -21,6 +21,7 @@ money moves and nothing knows.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -30,11 +31,15 @@ from zerotrust.idempotency import (
     IdempotencyStore,
     Outcome,
     Result,
+    StaleVerdict,
     scope_key,
 )
 from zerotrust.ledger import Ledger, require_shared_database
 from zerotrust.policy import Decision, PolicyEngine, PurchaseRequest
-from zerotrust.provider import ProviderTimeout
+from zerotrust.provider import ProviderError, ProviderTimeout
+# How long the provider's order list may lag behind a charge. Reconciliation
+# asks the same question for the same reason, so they share one value.
+from zerotrust.reconcile import DEFAULT_NOT_FOUND_GRACE_SECONDS
 
 #: Every Phase 1 outcome maps to exactly one audit event. No outcome is
 #: unlogged, and none produces two entries.
@@ -45,7 +50,9 @@ OUTCOME_EVENTS = {
     Outcome.IN_PROGRESS: EventType.IDEMPOTENCY_IN_PROGRESS,
     Outcome.CONFLICT: EventType.IDEMPOTENCY_CONFLICT,
     Outcome.AWAITING_VERIFICATION: EventType.PAYMENT_PENDING_VERIFICATION,
+    Outcome.RECOVERED: EventType.IDEMPOTENCY_RECOVERED,
 }
+
 
 
 @dataclass(frozen=True)
@@ -94,6 +101,9 @@ class PurchaseGateway:
         execute_purchase: Callable[[PurchaseRequest], dict],
         audit: Optional[AuditLog] = None,
         ledger: Optional[Ledger] = None,
+        find_orders: Optional[Callable[[PurchaseRequest], list]] = None,
+        not_found_grace_seconds: float = DEFAULT_NOT_FOUND_GRACE_SECONDS,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self.policy = policy
         self.store = store
@@ -106,6 +116,14 @@ class PurchaseGateway:
         self.ledger = ledger
         require_shared_database(ledger, store.db, "PurchaseGateway")
         self._execute_purchase = execute_purchase
+        #: Phase 12. Asks the provider which orders exist for this purchase.
+        #: With it, a stale key is checked before it is re-run: a claimant
+        #: that charged and then died is completed from its order instead of
+        #: charged again. Without it, a stale reclaim re-runs the purchase --
+        #: correct only if the stalled claimant never reached the provider.
+        self._find_orders = find_orders
+        self.not_found_grace_seconds = not_found_grace_seconds
+        self._clock = clock
 
     def submit(
         self, request: PurchaseRequest, request_id: Optional[str] = None
@@ -193,6 +211,9 @@ class PurchaseGateway:
                 logged_action,
                 agent_id=request.agent_id,
                 also=book_sale if self.ledger is not None else None,
+                verify_stale=(self._stale_verifier(request)
+                              if self._find_orders is not None else None),
+                also_on_freeze=book_suspense if self.ledger is not None else None,
             )
         except CompletionNotRecorded as exc:
             # The provider succeeded; the COMPLETED record and its sale could
@@ -280,7 +301,10 @@ class PurchaseGateway:
             **common,
         )
 
-        if result.executed:
+        recovered = result.outcome is Outcome.RECOVERED
+        if result.executed or recovered:
+            # A recovered key did charge -- in the attempt that died -- so its
+            # budget is spent and its capture belongs in the record.
             self.policy.confirm_slot(request.agent_id, request.idempotency_key)
             self._log(
                 EventType.PAYMENT_CAPTURED,
@@ -289,6 +313,7 @@ class PurchaseGateway:
                 details={
                     "amount_paise": request.amount_paise,
                     "response": result.response,
+                    "recovered_from_stalled_attempt": recovered,
                     # Capture is simulated -- see zerotrust/provider.py.
                     "simulated": bool(
                         isinstance(result.response, dict)
@@ -301,6 +326,42 @@ class PurchaseGateway:
         return PurchaseOutcome(
             decision=decision, result=result, request_id=request_id
         )
+
+    def _stale_verifier(self, request: PurchaseRequest):
+        """Build the question asked before a stale key is re-run.
+
+        Each answer maps to the one safe action for it. The asymmetry is
+        deliberate: only a clear "no order, and long enough ago to be sure"
+        permits running the purchase again. Everything ambiguous freezes.
+        """
+        def verify(claim: Result) -> StaleVerdict:
+            try:
+                orders = list(self._find_orders(request))
+            except (ProviderTimeout, ProviderError) as exc:
+                return StaleVerdict.unknown(
+                    f"could not ask the provider whether the stalled attempt "
+                    f"charged ({exc}); the key is frozen rather than re-run")
+            if len(orders) > 1:
+                return StaleVerdict.unknown(
+                    f"{len(orders)} provider orders already exist for this "
+                    f"purchase; choosing between them needs a human")
+            if len(orders) == 1:
+                order = orders[0]
+                if order.get("amount") != request.amount_paise:
+                    return StaleVerdict.unknown(
+                        f"the provider's order is for {order.get('amount')} "
+                        f"paise but this purchase is for "
+                        f"{request.amount_paise}; not completing from it")
+                return StaleVerdict.executed(order)
+            age = self._clock() - (claim.prior_claimed_at or 0.0)
+            if age < self.not_found_grace_seconds:
+                return StaleVerdict.unknown(
+                    f"the provider shows no order yet, but the stalled attempt "
+                    f"began {age:.0f}s ago and its order list can lag by up to "
+                    f"{self.not_found_grace_seconds:.0f}s; absence is not yet "
+                    f"evidence")
+            return StaleVerdict.not_executed()
+        return verify
 
     def _log(self, event_type: EventType, actor: Actor, **kwargs) -> None:
         if self.audit is None:
