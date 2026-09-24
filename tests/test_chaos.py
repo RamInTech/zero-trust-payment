@@ -7,9 +7,8 @@ Three claims:
      afterwards.
   2. The harness can actually fail. A stack that charges money and books no
      sale is caught, so a green run means something.
-  3. The one gap this cannot close is pinned down rather than hidden: a
-     claimant killed after charging leaves a record that the staleness timeout
-     will later reclaim, and that reclaim can charge a second time.
+  3. A claimant SIGKILLed after charging is recovered by the next retry, not
+     charged again (Phase 12) -- and without that check, the harness fails.
 """
 
 from __future__ import annotations
@@ -71,6 +70,10 @@ def test_the_money_still_adds_up_under_injected_failure(test_dsn, seed):
     assert totals["process_kills"] == 4, "the subprocesses were not really killed"
     assert totals["mid_run_reads"] > 0
     assert totals["revenue_paise"] == totals["charged_paise"]
+    # Every killed claimant was retried and settled; none left hanging.
+    assert totals["stalled_retried"] >= 4
+    assert totals["recovered"] > 0, "no killed-after-charge key was recovered"
+    assert totals["in_flight_records"] == 0
 
 
 def test_a_killed_process_leaves_a_charge_that_reconciliation_books(db):
@@ -153,57 +156,53 @@ def test_a_gateway_that_books_nothing_is_repaired_before_the_round_ends(test_dsn
     assert round_result.revenue_paise == round_result.charged_paise
 
 
-# -- 3. the gap this cannot close ------------------------------------------
+# -- 3. the gap Phase 12 closed ---------------------------------------------
 
-def test_a_crashed_claimant_can_be_charged_again_after_the_staleness_timeout(db):
-    """The honest limit, pinned by a test instead of left as prose.
+def test_a_claimant_killed_after_charging_is_recovered_not_charged_again(db):
+    """The case Phase 11 could only document, now closed.
 
-    A process killed after charging leaves its key PROCESSING. The staleness
-    timeout exists so such a key is not wedged forever -- and reclaiming it
-    runs the action again, which charges again. The ledger still books ONE
-    sale for the key, so the books do not double-count; but they also cannot
-    see the second charge, and `discrepancies()` reports nothing. Only asking
-    the provider finds it, which is what reconciliation does: two orders on one
-    receipt is the case it refuses to resolve on its own.
-
-    The chaos harness sets its staleness timeout longer than a round precisely
-    so this cannot happen mid-round and be mistaken for a bug in something else.
+    A real process charges and is SIGKILLed before recording it. Once its key
+    goes stale, a retry reclaims it -- and before Phase 12, ran the purchase
+    again. The retry now asks the provider, finds the dead claimant's order,
+    and completes the key from it.
     """
     engine = _mandate(db)
     audit, ledger = AuditLog(db), Ledger(db)
     provider = ChaosProvider(db)
-    # Stale almost immediately: the reclaim this documents takes 30s by default.
     store = IdempotencyStore(db, stale_after_seconds=0.05)
 
     assert _run_worker(db, "k-stale", 7_000).returncode < 0
     time.sleep(0.1)
 
     from zerotrust.gateway import PurchaseGateway
-    retried = PurchaseGateway(
+    retry = PurchaseGateway(
         engine, store,
         lambda r: provider.create_order(r.amount_paise,
                                         receipt=receipt_for_key("k-stale")),
-        audit=audit, ledger=ledger)
-    outcome = retried.submit(PurchaseRequest(AGENT, "SKU-CHAOS", 7_000, "k-stale"))
+        audit=audit, ledger=ledger,
+        find_orders=lambda r: provider.orders_for_receipt(receipt_for_key("k-stale")),
+        not_found_grace_seconds=0)
+    outcome = retry.submit(PurchaseRequest(AGENT, "SKU-CHAOS", 7_000, "k-stale"))
 
-    assert outcome.outcome.value == "RECLAIMED"
-    charges = provider.orders_for_receipt(receipt_for_key("k-stale"))
-    assert len(charges) == 2, "the documented double charge did not occur"
-
-    # The books stay internally consistent, and refuse to count it twice.
+    assert outcome.outcome.value == "RECOVERED"
+    assert len(provider.orders_for_receipt(receipt_for_key("k-stale"))) == 1
+    assert store.get("k-stale", agent_id=AGENT)["status"] == COMPLETED
     assert ledger.trial_balance()[REVENUE] == -7_000
     assert len([t for t in ledger.recent(50) if t["kind"] == SALE]) == 1
-    assert ledger.verify().balanced
-    # ...and cannot see the second charge at all.
     assert ledger.discrepancies(store.records()) == []
 
-    # Asking the provider is what surfaces it, and it needs a human.
-    reconciler = Reconciler(provider, store, audit=audit, policy=engine,
-                            ledger=ledger, not_found_grace_seconds=0)
-    result = reconciler.reconcile("k-stale", receipt_for_key("k-stale"),
-                                  agent_id=AGENT)
-    assert result.finding is Finding.NEEDS_HUMAN_REVIEW
-    assert "2 provider orders" in result.reason
+
+def test_without_verification_the_harness_catches_the_second_charge(test_dsn):
+    """The same rounds, with the Phase 12 check turned off, must fail --
+    naming the receipt the retry charged twice. This is the proof that the
+    green runs above depend on the fix, not on the faults happening to miss."""
+    report = ChaosHarness(test_dsn, rounds=2, purchases=12, process_kills=2,
+                          seed=31, verify_before_reclaim=False).run()
+
+    assert not report.survived_all
+    violations = " ".join(v for r in report.failures for v in r.violations)
+    assert "charged more than once" in violations
+    assert report.totals["recovered"] == 0
 
 
 # -- the report ------------------------------------------------------------

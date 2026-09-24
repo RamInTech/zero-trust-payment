@@ -42,14 +42,16 @@ warning, and the seed is printed so it can be replayed:
   4. the books and the purchase records do not disagree (`discrepancies()`);
   5. the ledger re-adds to zero, and every mid-run read did too;
   6. the audit chain verifies;
-  7. a record is COMPLETED if and only if its receipt was charged exactly once.
+  7. a record is COMPLETED if and only if its receipt was charged exactly once;
+  8. no key is left in flight once it has been retried.
 
-Records still PROCESSING at the end are counted and reported rather than
-failed: a claimant that was killed leaves one, and the staleness timeout --
-deliberately set longer than a round -- is what unjams it later. What that
-timeout can then do is a real, documented gap, and
-`tests/test_chaos.py::test_a_crashed_claimant_can_be_charged_again_after_the_staleness_timeout`
-holds it still rather than letting this harness pretend it cannot happen.
+RETRYING THE DEAD (Phase 12). A killed claimant leaves its key PROCESSING. Once
+the staleness timeout passes, every such key is retried through the same
+gateway -- and the gateway now asks the provider before re-running a stale key.
+A claimant that charged before it died is RECOVERED from its order; one that
+died before charging is RECLAIMED and charged once. Before Phase 12 this retry
+charged the first kind a second time, which is why `verify_before_reclaim=False`
+exists: with it, the same rounds fail invariant 1, and a test asserts they do.
 """
 
 from __future__ import annotations
@@ -72,7 +74,13 @@ from zerotrust.audit import AuditLog
 from zerotrust.db import DEFAULT_DSN, Database
 from zerotrust.faults import InjectedCrash
 from zerotrust.gateway import PurchaseGateway
-from zerotrust.idempotency import COMPLETED, FAILED, IdempotencyStore
+from zerotrust.idempotency import (
+    COMPLETED,
+    FAILED,
+    PROCESSING,
+    IdempotencyStore,
+    Outcome,
+)
 from zerotrust.ledger import (
     REVENUE,
     SUSPENSE_CLEARING,
@@ -104,10 +112,10 @@ IN_PROCESS_FAULTS = (
     (TIMEOUT_AFTER, 14), (CRASH_AFTER, 14), (BACKEND_KILL, 16),
 )
 
-#: Longer than any round, on purpose: a killed claimant's record must still be
-#: PROCESSING when the invariants are checked, so it is counted as in-flight
-#: rather than quietly reclaimed and re-executed mid-round.
-ROUND_STALE_AFTER_SECONDS = 3600.0
+#: Short, so a killed claimant's key goes stale within the round and its retry
+#: exercises the verify-before-reclaim path for real. Nothing retries a key
+#: while its purchase is still running, so this cannot reclaim a live claim.
+ROUND_STALE_AFTER_SECONDS = 0.2
 
 _PROVIDER_SCHEMA = """
 CREATE TABLE IF NOT EXISTS chaos_provider_orders (
@@ -201,6 +209,9 @@ class RoundResult:
     charged_paise: int = 0
     revenue_paise: int = 0
     repairs: int = 0
+    stalled_retried: int = 0
+    recovered: int = 0
+    reclaimed: int = 0
     in_flight_records: int = 0
     mid_run_reads: int = 0
     violations: list = field(default_factory=list)
@@ -246,6 +257,9 @@ class ChaosReport:
             "backend_kills": sum(r.backend_kills for r in self.rounds),
             "process_kills": sum(r.process_kills for r in self.rounds),
             "repairs": sum(r.repairs for r in self.rounds),
+            "stalled_retried": sum(r.stalled_retried for r in self.rounds),
+            "recovered": sum(r.recovered for r in self.rounds),
+            "reclaimed": sum(r.reclaimed for r in self.rounds),
             "in_flight_records": sum(r.in_flight_records for r in self.rounds),
             "mid_run_reads": sum(r.mid_run_reads for r in self.rounds),
             "faults": dict(sorted(faults.items())),
@@ -296,7 +310,10 @@ class ChaosReport:
             f"| Database backends killed mid-flight | {t['backend_kills']} |",
             f"| Processes SIGKILLed | {t['process_kills']} |",
             f"| Divergences repaired by reconciliation | {t['repairs']} |",
-            f"| Records left in flight (killed claimants) | {t['in_flight_records']} |",
+            f"| Stalled keys retried after the staleness timeout | {t['stalled_retried']} |",
+            f"| ...recovered from an order the dead claimant made | {t['recovered']} |",
+            f"| ...reclaimed and charged once | {t['reclaimed']} |",
+            f"| Keys still in flight at the end | {t['in_flight_records']} |",
             f"| Mid-run reads of the books, all netting zero | {t['mid_run_reads']} |",
             "",
             "## Faults injected",
@@ -317,6 +334,7 @@ class ChaosReport:
             "5. The ledger re-adds to zero, and so did every mid-run read.",
             "6. The audit hash chain verifies.",
             "7. A record is COMPLETED if and only if its receipt was charged once.",
+            "8. No key is left in flight once it has been retried.",
             "",
             "## Rounds",
             "",
@@ -354,6 +372,7 @@ class ChaosHarness:
         seed: Optional[int] = None,
         book_sales: bool = True,
         inject_double_charge: bool = False,
+        verify_before_reclaim: bool = True,
     ) -> None:
         self.dsn = dsn
         self.rounds = rounds
@@ -369,6 +388,9 @@ class ChaosHarness:
         #: undo -- reconciliation refuses to choose between the two orders --
         #: so a harness that reported it as a survival would be worthless.
         self.inject_double_charge = inject_double_charge
+        #: Off only in the test showing what Phase 12 prevents: retrying a
+        #: killed claimant without asking the provider charges it again.
+        self.verify_before_reclaim = verify_before_reclaim
 
     # -- running -----------------------------------------------------------
 
@@ -422,7 +444,13 @@ class ChaosHarness:
         result.faults = dict(sorted(Counter(plan.values()).items()))
         kills = threading.Lock()
 
+        calm = threading.Event()   # set once retries begin: no more faults
+
         def execute(request: PurchaseRequest) -> dict:
+            if calm.is_set():
+                return provider.create_order(
+                    request.amount_paise,
+                    receipt=receipt_for_key(request.idempotency_key))
             fault = plan[request.idempotency_key]
             if fault == LATENCY:
                 time.sleep(rng.uniform(0.005, 0.03))
@@ -446,8 +474,16 @@ class ChaosHarness:
                     result.backend_kills += killed
             return order
 
-        gateway = PurchaseGateway(engine, store, execute, audit=audit,
-                                  ledger=ledger if self.book_sales else None)
+        gateway = PurchaseGateway(
+            engine, store, execute, audit=audit,
+            ledger=ledger if self.book_sales else None,
+            find_orders=(
+                (lambda r: provider.orders_for_receipt(
+                    receipt_for_key(r.idempotency_key)))
+                if self.verify_before_reclaim else None),
+            # The chaos provider lists an order the instant it exists, so no
+            # lag window is needed: an empty answer really means "never charged".
+            not_found_grace_seconds=0)
 
         stop = threading.Event()
         bad_reads: list = []
@@ -493,6 +529,9 @@ class ChaosHarness:
                 f"the books did not net to zero on {len(bad_reads)} mid-run "
                 f"read(s): {bad_reads[:3]}")
 
+        calm.set()
+        self._retry_stalled(gateway, store, amounts, result)
+
         result.repairs = self._reconcile_everything(provider, store, audit,
                                                     engine, ledger, plan)
         self._check(db, provider, store, ledger, audit, plan, result)
@@ -531,6 +570,30 @@ class ChaosHarness:
 
     # -- putting it back together -----------------------------------------
 
+    def _retry_stalled(self, gateway, store, amounts: dict,
+                       result: RoundResult) -> None:
+        """Retry every key a dead claimant left behind, the way a client would.
+
+        This is the step that used to double charge: the retry reclaims a
+        stale key and runs the purchase again, whether or not the dead
+        claimant had already charged. The gateway now asks the provider first.
+        """
+        stalled = [r["key"] for r in store.records() if r["status"] == PROCESSING]
+        if not stalled:
+            return
+        time.sleep(store.stale_after_seconds + 0.05)
+        for scoped in stalled:
+            _agent, key = _unscope(scoped)
+            result.stalled_retried += 1
+            try:
+                outcome = gateway.submit(PurchaseRequest(AGENT, SKU, amounts[key], key))
+            except (ProviderTimeout, InjectedCrash, psycopg.Error, RuntimeError):
+                continue
+            if outcome.outcome is Outcome.RECOVERED:
+                result.recovered += 1
+            elif outcome.outcome is Outcome.RECLAIMED:
+                result.reclaimed += 1
+
     def _reconcile_everything(self, provider, store, audit, engine, ledger,
                               plan: dict) -> int:
         """What an operator would do after the dust settles: ask the provider
@@ -566,6 +629,11 @@ class ChaosHarness:
         records = {r["key"]: r["status"] for r in store.records()}
         result.in_flight_records = sum(
             1 for s in records.values() if s not in (COMPLETED, FAILED))
+
+        if result.in_flight_records:
+            result.violations.append(
+                f"{result.in_flight_records} key(s) still in flight after "
+                f"their retry")
 
         doubled = [r for r, n in charged_by_receipt.items() if n > 1]
         if doubled:
